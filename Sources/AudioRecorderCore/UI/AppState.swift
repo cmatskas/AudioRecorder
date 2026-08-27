@@ -9,7 +9,7 @@ public final class AppState: ObservableObject {
 
     @Published public private(set) var devices: [AudioInputDevice] = []
     @Published public var selectedMicUID: String? {
-        didSet { if oldValue != selectedMicUID { rebuildEngine() } }
+        didSet { if oldValue != selectedMicUID && !isInitializing { rebuildEngine() } }
     }
     @Published public var micEnabled = true {
         didSet { if oldValue != micEnabled { rebuildEngine() } }
@@ -22,6 +22,7 @@ public final class AppState: ObservableObject {
     @Published public private(set) var recordingStart: Date?
     @Published public var statusMessage: String?
     @Published public var errorMessage: String?
+    @Published public private(set) var lastSavedURL: URL?
     @Published public private(set) var recoveryItems: [RecoveryManager.RecoveryItem] = []
     @Published public private(set) var userDestination: URL?
 
@@ -40,6 +41,9 @@ public final class AppState: ObservableObject {
     /// Invalidates in-flight engine builds when configuration changes again.
     private var engineGeneration = 0
     private var pendingDeviceRefresh: DispatchWorkItem?
+    /// Suppresses engine rebuilds triggered by property observers during init,
+    /// so startup builds the capture engine exactly once.
+    private var isInitializing = true
 
     public init() {
         backupRoot = FileManager.default.homeDirectoryForCurrentUser
@@ -56,6 +60,7 @@ public final class AppState: ObservableObject {
             self?.handleDeviceListChange()
         }
         recoveryItems = RecoveryManager.scan(root: backupRoot)
+        isInitializing = false
         rebuildEngine()
     }
 
@@ -239,7 +244,8 @@ public final class AppState: ObservableObject {
                     guard let self else { return }
                     self.isSaving = false
                     let saved = result.userM4A ?? result.backupM4A
-                    var message = "Saved: \(saved?.path ?? result.sessionDirectory.path)"
+                    self.lastSavedURL = saved
+                    var message = "Saved \(saved?.lastPathComponent ?? result.sessionDirectory.lastPathComponent)"
                     if !result.warnings.isEmpty {
                         message += "\n⚠ " + result.warnings.joined(separator: "\n⚠ ")
                     }
@@ -293,5 +299,14 @@ public final class AppState: ObservableObject {
 
     public func openBackupFolder() {
         NSWorkspace.shared.open(backupRoot)
+    }
+
+    public func revealLastSaved() {
+        guard let url = lastSavedURL else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    public func revealInFinder(_ url: URL) {
+        NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 }

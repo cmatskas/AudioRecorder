@@ -33,6 +33,19 @@ public enum AudioDeviceList {
         return devices
     }
 
+    /// Resolves a device by UID (device IDs are not stable across
+    /// configuration changes; UIDs are).
+    public static func deviceID(forUID uid: String) -> AudioObjectID? {
+        guard let ids = try? caGetDeviceIDs() else { return nil }
+        for id in ids {
+            if let candidate = try? caGetString(id, kAudioDevicePropertyDeviceUID, what: "device UID"),
+               candidate == uid {
+                return id
+            }
+        }
+        return nil
+    }
+
     /// The system default input device, if any.
     public static func defaultInputDeviceID() -> AudioObjectID? {
         let id = try? caGetValue(
@@ -40,6 +53,37 @@ public enum AudioDeviceList {
             kAudioHardwarePropertyDefaultInputDevice,
             initial: AudioObjectID(kAudioObjectUnknown),
             what: "default input device"
+        )
+        guard let id, id != kAudioObjectUnknown else { return nil }
+        return id
+    }
+
+    /// The built-in output device (speakers), if present. Preferred as the
+    /// aggregate clock source: always available, cycles steadily, and has no
+    /// input streams that would complicate the channel layout or activate a
+    /// Bluetooth microphone.
+    public static func builtInOutputDeviceID() -> AudioObjectID? {
+        guard let ids = try? caGetDeviceIDs() else { return nil }
+        for id in ids {
+            let transport = (try? caGetValue(
+                id, kAudioDevicePropertyTransportType,
+                initial: UInt32(0), what: "transport type"
+            )) ?? 0
+            guard transport == kAudioDeviceTransportTypeBuiltIn else { continue }
+            let outputChannels = (try? caGetStreamChannelCounts(id, scope: kAudioDevicePropertyScopeOutput))?
+                .reduce(0, +) ?? 0
+            if outputChannels > 0 { return id }
+        }
+        return nil
+    }
+
+    /// The system default output device, if any.
+    public static func defaultOutputDeviceID() -> AudioObjectID? {
+        let id = try? caGetValue(
+            AudioObjectID(kAudioObjectSystemObject),
+            kAudioHardwarePropertyDefaultOutputDevice,
+            initial: AudioObjectID(kAudioObjectUnknown),
+            what: "default output device"
         )
         guard let id, id != kAudioObjectUnknown else { return nil }
         return id

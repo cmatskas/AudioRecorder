@@ -115,6 +115,23 @@ func caGetStreamChannelCounts(
     return abl.map { Int($0.mNumberChannels) }
 }
 
+/// Returns the stream object IDs of a device for the given scope.
+func caGetStreamIDs(
+    _ objectID: AudioObjectID,
+    scope: AudioObjectPropertyScope
+) -> [AudioObjectID] {
+    var address = caAddress(kAudioDevicePropertyStreams, scope: scope)
+    var size: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(objectID, &address, 0, nil, &size) == noErr, size > 0 else {
+        return []
+    }
+    var ids = [AudioObjectID](repeating: 0, count: Int(size) / MemoryLayout<AudioObjectID>.size)
+    guard AudioObjectGetPropertyData(objectID, &address, 0, nil, &size, &ids) == noErr else {
+        return []
+    }
+    return ids
+}
+
 /// Total input channel count for a device.
 func caGetInputChannelCount(_ objectID: AudioObjectID) -> Int {
     let counts = (try? caGetStreamChannelCounts(objectID, scope: kAudioDevicePropertyScopeInput)) ?? []

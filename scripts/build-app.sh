@@ -30,6 +30,10 @@ rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 cp "$BINARY" "$APP_DIR/Contents/MacOS/$APP_NAME"
 
+if [[ -f "Assets/AppIcon.icns" ]]; then
+    cp "Assets/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
+fi
+
 cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -45,6 +49,8 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
     <string>Audio Recorder</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleShortVersionString</key>
     <string>$VERSION</string>
     <key>CFBundleVersion</key>
@@ -65,8 +71,24 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-echo "==> Code signing (ad-hoc)"
-codesign --force --sign - --identifier "$BUNDLE_ID" "$APP_DIR"
+echo "==> Code signing"
+# Prefer a Developer ID Application identity (set SIGN_IDENTITY to override,
+# or SIGN_IDENTITY=- to force ad-hoc). Developer ID signing enables the
+# hardened runtime, which notarization requires.
+if [[ -z "${SIGN_IDENTITY:-}" ]]; then
+    SIGN_IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
+        | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)".*/\1/' || true)
+fi
+if [[ -n "${SIGN_IDENTITY:-}" && "$SIGN_IDENTITY" != "-" ]]; then
+    echo "    identity: $SIGN_IDENTITY"
+    codesign --force --options runtime --timestamp \
+        --entitlements scripts/entitlements.plist \
+        --sign "$SIGN_IDENTITY" --identifier "$BUNDLE_ID" "$APP_DIR"
+else
+    echo "    identity: ad-hoc (downloaders must right-click > Open)"
+    codesign --force --entitlements scripts/entitlements.plist \
+        --sign - --identifier "$BUNDLE_ID" "$APP_DIR"
+fi
 
 echo "==> Done: $APP_DIR"
 
