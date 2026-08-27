@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select newest Xcode
+        run: |
+          sudo xcode-select --switch /Applications/Xcode.app
+          swift --version
+
+      - name: Build
+        run: swift build --configuration release
+
+      - name: Test
+        run: swift test
+
+      - name: Build app bundle
+        # Ad-hoc signed here: release signing happens in release.yml.
+        run: ./scripts/build-app.sh
+        env:
+          SIGN_IDENTITY: "-"
+
+      - name: Verify bundle
+        run: |
+          codesign --verify --verbose=2 dist/AudioRecorder.app
+          plutil -lint dist/AudioRecorder.app/Contents/Info.plist
