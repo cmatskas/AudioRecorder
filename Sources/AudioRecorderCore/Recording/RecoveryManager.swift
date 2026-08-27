@@ -13,17 +13,23 @@ public enum RecoveryManager {
         public let manifest: SessionManifest
 
         /// Approximate recorded duration, derived from segment sizes on disk.
+        /// Uses the longest track, since sources can differ in length.
         public var estimatedDuration: TimeInterval {
-            let bytesPerFrame = Double(manifest.channels * 2)
-            var totalBytes = 0.0
-            for segment in manifest.segments {
-                let url = directory.appendingPathComponent(segment)
-                if let size = try? FileManager.default
-                    .attributesOfItem(atPath: url.path)[.size] as? Int {
-                    totalBytes += Double(max(0, size - 4096))  // minus approx header
+            var longest: TimeInterval = 0
+            for track in manifest.tracks {
+                let bytesPerFrame = Double(max(1, track.channels) * 2)
+                var totalBytes = 0.0
+                for segment in track.segments {
+                    let url = directory.appendingPathComponent(segment)
+                    if let size = try? FileManager.default
+                        .attributesOfItem(atPath: url.path)[.size] as? Int {
+                        totalBytes += Double(max(0, size - 4096))  // minus approx header
+                    }
                 }
+                let rate = track.sampleRate > 0 ? track.sampleRate : 48_000
+                longest = max(longest, totalBytes / (bytesPerFrame * rate))
             }
-            return totalBytes / (bytesPerFrame * manifest.sampleRate)
+            return longest
         }
     }
 

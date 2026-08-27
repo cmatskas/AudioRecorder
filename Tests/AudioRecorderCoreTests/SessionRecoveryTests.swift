@@ -4,10 +4,11 @@ import XCTest
 
 final class SessionRecoveryTests: XCTestCase {
     private var root: URL!
+    private let ticksPerSecond = CaptureTrack.hostTicksPerSecond()
 
     override func setUpWithError() throws {
         root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("SessionTests-\(UUID().uuidString)")
+            .appendingPathComponent("RecoveryTests-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     }
 
@@ -15,147 +16,186 @@ final class SessionRecoveryTests: XCTestCase {
         try? FileManager.default.removeItem(at: root)
     }
 
-    func testManifestRoundTrip() throws {
-        var manifest = SessionManifest(
-            name: "test_session",
-            sampleRate: 48_000,
-            channels: 4,
-            micName: "Test Mic",
-            systemAudio: true
-        )
-        // ISO8601 stores whole seconds; use a whole-second date for exact equality.
-        manifest.createdAt = Date(timeIntervalSince1970: 1_756_300_000)
-        manifest.segments = ["segment_001.caf"]
-        try manifest.save(to: root)
-        let loaded = try SessionManifest.load(from: root)
-        XCTAssertEqual(loaded, manifest)
-        XCTAssertEqual(loaded.status, .recording)
-    }
-
-    func testSessionWriterProducesSegmentsAndManifest() throws {
-        let writer = try SessionWriter(
+    /// The store plus per-source writers must produce one segment set per
+    /// source, all registered in a single manifest.
+    func testStoreAndTrackWritersProduceSegmentsAndManifest() throws {
+        let store = try SessionStore(
             destinationRoot: root,
             sessionName: "session_a",
-            sampleRate: 1000,
-            channels: 2,
-            micName: nil,
-            systemAudio: true,
-            segmentDuration: 1,  // 1000 frames per segment: forces rolling
-            syncInterval: 0.5
+            micName: "Mic",
+            tracks: [
+                SessionManifest.Track(
+                    label: "mic", sampleRate: 1000, channels: 2,
+                    hostTicksPerSecond: ticksPerSecond
+                ),
+                SessionManifest.Track(
+                    label: "system", sampleRate: 1000, channels: 2,
+                    hostTicksPerSecond: ticksPerSecond
+                ),
+            ]
+        )
+        // 1 s segments at 1 kHz, so 2.5 s of audio rolls into 3 segments.
+        let micWriter = try TrackWriter(
+            store: store, label: "mic", sampleRate: 1000,
+            segmentDuration: 1, syncInterval: 0.5
+        )
+        let sysWriter = try TrackWriter(
+            store: store, label: "system", sampleRate: 1000,
+            segmentDuration: 1, syncInterval: 0.5
         )
         let chunk = [Float](repeating: 0.25, count: 500 * 2)
-        // 2500 frames -> segments of 1000/1000/500.
         for _ in 0..<5 {
-            try chunk.withUnsafeBufferPointer { buffer in
-                try writer.append(buffer.baseAddress!, frameCount: 500)
+            try chunk.withUnsafeBufferPointer {
+                try micWriter.append($0.baseAddress!, frameCount: 500)
             }
         }
-        try writer.finish()
+        // The system source stalls early, as it would with no audio playing.
+        try chunk.withUnsafeBufferPointer {
+            try sysWriter.append($0.baseAddress!, frameCount: 500)
+        }
+        try micWriter.finish()
+        try sysWriter.finish()
+        try store.setStatus(.complete)
 
-        let manifest = try SessionManifest.load(from: writer.sessionDirectory)
+        let manifest = try SessionManifest.load(from: store.directory)
         XCTAssertEqual(manifest.status, .complete)
-        XCTAssertEqual(manifest.segments.count, 3)
-        for segment in manifest.segments {
-            let url = writer.sessionDirectory.appendingPathComponent(segment)
-            XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
-            let file = try AVAudioFile(forReading: url, commonFormat: .pcmFormatFloat32, interleaved: true)
-            XCTAssertGreaterThan(file.length, 0)
+        XCTAssertEqual(manifest.tracks.count, 2)
+        XCTAssertEqual(manifest.track(labeled: "mic")?.segments.count, 3)
+        XCTAssertEqual(manifest.track(labeled: "system")?.segments.count, 1)
+
+        for track in manifest.tracks {
+            for segment in track.segments {
+                let url = store.directory.appendingPathComponent(segment)
+                XCTAssertTrue(FileManager.default.fileExists(atPath: url.path), segment)
+                let file = try AVAudioFile(
+                    forReading: url, commonFormat: .pcmFormatFloat32, interleaved: true
+                )
+                XCTAssertGreaterThan(file.length, 0, segment)
+                XCTAssertEqual(file.processingFormat.channelCount, 2)
+            }
         }
     }
 
-    func testRecoveryScanFindsInterruptedSessionsOnly() throws {
-        // Interrupted session: manifest left in .recording state with one segment.
-        let crashedDir = root.appendingPathComponent("crashed_session")
-        try FileManager.default.createDirectory(at: crashedDir, withIntermediateDirectories: true)
-        var crashed = SessionManifest(
-            name: "crashed_session",
-            sampleRate: 44_100,
-            channels: 2,
-            micName: nil,
-            systemAudio: true
-        )
-        crashed.segments = ["segment_001.caf"]
-        try crashed.save(to: crashedDir)
-        let caf = try CAFWriter(
-            url: crashedDir.appendingPathComponent("segment_001.caf"),
-            sampleRate: 44_100,
-            channels: 2
-        )
-        let tone = [Float](repeating: 0.5, count: 44_100 * 2)
-        try tone.withUnsafeBufferPointer { buffer in
-            try caf.append(buffer.baseAddress!, frameCount: 44_100)
-        }
-        caf.sync()  // crash: no finalize
-
-        // Completed session: should not be picked up.
+    func testRecoveryScanIgnoresCompletedSessions() throws {
         let completeDir = root.appendingPathComponent("complete_session")
         try FileManager.default.createDirectory(at: completeDir, withIntermediateDirectories: true)
         var complete = SessionManifest(
-            name: "complete_session",
-            sampleRate: 44_100,
-            channels: 2,
-            micName: nil,
-            systemAudio: true
+            name: "complete_session", micName: nil,
+            tracks: [
+                SessionManifest.Track(
+                    label: "mic", sampleRate: 48_000, channels: 2,
+                    hostTicksPerSecond: ticksPerSecond
+                )
+            ]
         )
         complete.status = .complete
         try complete.save(to: completeDir)
 
-        let items = RecoveryManager.scan(root: root)
-        XCTAssertEqual(items.count, 1)
-        XCTAssertEqual(items.first?.manifest.name, "crashed_session")
-        XCTAssertEqual(items.first!.estimatedDuration, 1.0, accuracy: 0.5)
-
-        // Recover: encodes an .m4a and marks complete.
-        let output = try RecoveryManager.recover(items.first!)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
-        let encoded = try AVAudioFile(forReading: output)
-        XCTAssertGreaterThan(encoded.length, 0)
-
         XCTAssertTrue(RecoveryManager.scan(root: root).isEmpty)
     }
 
-    func testEncoderMixes4ChannelsToStereo() throws {
-        let sessionDir = root.appendingPathComponent("mix_session")
-        try FileManager.default.createDirectory(at: sessionDir, withIntermediateDirectories: true)
-        var manifest = SessionManifest(
-            name: "mix_session",
-            sampleRate: 44_100,
-            channels: 4,
-            micName: "mic",
-            systemAudio: true
-        )
-        manifest.segments = ["segment_001.caf"]
+    /// The crash case: two tracks of different lengths, neither finalized,
+    /// manifest still marked `recording`. All captured audio must survive and
+    /// recover into a correctly aligned render.
+    func testRecoversInterruptedSessionWithUnevenStreams() throws {
+        let dir = root.appendingPathComponent("crashed_session")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
 
-        let caf = try CAFWriter(
-            url: sessionDir.appendingPathComponent("segment_001.caf"),
-            sampleRate: 44_100,
-            channels: 4
-        )
-        // mic pair at 0.25, system pair at 0.25: mix should be ~0.5.
-        let frameCount = 44_100
-        var frames = [Float](repeating: 0, count: frameCount * 4)
-        for i in 0..<(frameCount * 4) { frames[i] = 0.25 }
-        try frames.withUnsafeBufferPointer { buffer in
-            try caf.append(buffer.baseAddress!, frameCount: frameCount)
+        // Mic: 2 s. System: 1 s. Both abandoned without finalize().
+        func writeUnfinalized(_ name: String, seconds: Double, amplitude: Float) throws {
+            let writer = try CAFWriter(
+                url: dir.appendingPathComponent(name), sampleRate: 48_000, channels: 2
+            )
+            let frames = Int(seconds * 48_000)
+            var buffer = [Float](repeating: amplitude, count: 4096 * 2)
+            var remaining = frames
+            while remaining > 0 {
+                let n = min(4096, remaining)
+                try buffer.withUnsafeBufferPointer {
+                    try writer.append($0.baseAddress!, frameCount: n)
+                }
+                remaining -= n
+            }
+            writer.sync()  // crash: no finalize
         }
-        try caf.finalize()
-        try manifest.save(to: sessionDir)
+        try writeUnfinalized("mic_001.caf", seconds: 2.0, amplitude: 0.3)
+        try writeUnfinalized("system_001.caf", seconds: 1.0, amplitude: 0.3)
 
-        let output = sessionDir.appendingPathComponent("out.m4a")
-        try SessionEncoder.encode(sessionDirectory: sessionDir, manifest: manifest, outputURL: output)
+        let anchor = UInt64(42 * ticksPerSecond)
+        let manifest = SessionManifest(
+            name: "crashed_session",
+            micName: "Mic",
+            tracks: [
+                SessionManifest.Track(
+                    label: "mic", sampleRate: 48_000, channels: 2,
+                    anchorHostTime: anchor, hostTicksPerSecond: ticksPerSecond,
+                    segments: ["mic_001.caf"]
+                ),
+                SessionManifest.Track(
+                    label: "system", sampleRate: 48_000, channels: 2,
+                    anchorHostTime: anchor, hostTicksPerSecond: ticksPerSecond,
+                    segments: ["system_001.caf"]
+                ),
+            ]
+        )
+        try manifest.save(to: dir)
 
-        let encoded = try AVAudioFile(forReading: output, commonFormat: .pcmFormatFloat32, interleaved: true)
-        XCTAssertEqual(encoded.processingFormat.channelCount, 2)
-        let buffer = AVAudioPCMBuffer(
-            pcmFormat: encoded.processingFormat,
-            frameCapacity: AVAudioFrameCount(encoded.length)
-        )!
-        try encoded.read(into: buffer)
-        // AAC is lossy and adds priming; check mid-file average amplitude.
-        let data = buffer.floatChannelData![0]
-        let mid = Int(buffer.frameLength) / 2
-        var sum: Float = 0
-        for i in (mid - 100)..<(mid + 100) { sum += abs(data[i * 2]) }
-        XCTAssertEqual(sum / 200, 0.5, accuracy: 0.05)
+        let items = RecoveryManager.scan(root: root)
+        XCTAssertEqual(items.count, 1)
+        let item = try XCTUnwrap(items.first)
+        XCTAssertEqual(item.manifest.name, "crashed_session")
+        // Duration comes from the longest track.
+        XCTAssertEqual(item.estimatedDuration, 2.0, accuracy: 0.2)
+
+        let output = try RecoveryManager.recover(item)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
+
+        let file = try AVAudioFile(
+            forReading: output, commonFormat: .pcmFormatFloat32, interleaved: true
+        )
+        XCTAssertEqual(Double(file.length) / file.processingFormat.sampleRate, 2.0, accuracy: 0.15)
+
+        // Recovered sessions are marked complete and no longer offered.
+        XCTAssertTrue(RecoveryManager.scan(root: root).isEmpty)
+    }
+
+    /// A v1 session (single pre-merged stream) must still recover.
+    func testRecoversVersion1Session() throws {
+        let dir = root.appendingPathComponent("v1_session")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+
+        let writer = try CAFWriter(
+            url: dir.appendingPathComponent("segment_001.caf"), sampleRate: 48_000, channels: 4
+        )
+        var buffer = [Float](repeating: 0.2, count: 4096 * 4)
+        var remaining = 48_000
+        while remaining > 0 {
+            let n = min(4096, remaining)
+            try buffer.withUnsafeBufferPointer {
+                try writer.append($0.baseAddress!, frameCount: n)
+            }
+            remaining -= n
+        }
+        writer.sync()
+
+        let v1 = """
+        {
+          "channels" : 4, "createdAt" : "2026-08-27T21:39:30Z",
+          "micName" : "AirPods", "name" : "v1_session", "sampleRate" : 48000,
+          "segments" : [ "segment_001.caf" ], "status" : "recording",
+          "systemAudio" : true, "version" : 1
+        }
+        """
+        try v1.write(
+            to: dir.appendingPathComponent(SessionManifest.filename),
+            atomically: true, encoding: .utf8
+        )
+
+        let items = RecoveryManager.scan(root: root)
+        XCTAssertEqual(items.count, 1)
+        let output = try RecoveryManager.recover(try XCTUnwrap(items.first))
+        let file = try AVAudioFile(forReading: output)
+        XCTAssertGreaterThan(file.length, 0)
+        XCTAssertTrue(RecoveryManager.scan(root: root).isEmpty)
     }
 }

@@ -2,30 +2,25 @@ import Accelerate
 import CoreAudio
 import Foundation
 import os
-import Synchronization
 
-/// Captures microphone and/or system audio.
+/// Captures microphone and/or system audio as two **independent** tracks.
 ///
-/// The two sources are captured by **independent** IO paths and merged in
-/// software:
-///
+/// Each source has its own IO path:
 ///  - Microphone: an IOProc on the mic device itself, which runs continuously.
 ///  - System audio: a Core Audio process tap (macOS 14.4+) inside a private
 ///    aggregate device paired with the tapped output device.
 ///
-/// They are deliberately *not* combined into a single aggregate device. A
-/// process tap emits no buffers until some process renders audio, and a tap
-/// placed in an aggregate gates that aggregate's entire IO cycle — with the
-/// mic in the same aggregate, the mic was starved until system audio happened
-/// to play (verified: no IO callbacks at all while the tap was idle, across
-/// several aggregate configurations). Independent paths make the microphone
-/// completely unaffected by system-audio activity.
+/// They are deliberately not combined into a single aggregate device. A process
+/// tap emits no buffers until some process renders audio, and a tap placed in
+/// an aggregate gates that aggregate's entire IO cycle — with the mic in the
+/// same aggregate the mic was starved until system audio happened to play.
 ///
-/// The microphone path is the timeline master when present: its callback
-/// assembles output frames and pulls whatever system audio has arrived,
-/// zero-filling when the tap is idle. Output is interleaved Float32:
-///   - mic + system: [micL, micR, sysL, sysR]
-///   - single source: [L, R]
+/// Nor are the two streams merged on the real-time thread. Each track is
+/// delivered to its own destinations at its own native sample rate, tagged with
+/// a host-time anchor (see `CaptureTrack`), and merged offline at finalize.
+/// This keeps the sources fully decoupled: a Bluetooth dropout on one cannot
+/// disturb the other, and alignment is recomputed from timestamps afterwards
+/// rather than guessed at live.
 public final class CaptureEngine: @unchecked Sendable {
     public struct Configuration: Equatable, Sendable {
         public var micDevice: AudioInputDevice?
@@ -42,10 +37,12 @@ public final class CaptureEngine: @unchecked Sendable {
 
     public let meters = LevelMeters()
 
+    /// Microphone track, present only while a mic is configured.
+    public private(set) var micTrack: CaptureTrack?
+    /// System audio track, present only while system capture is configured.
+    public private(set) var systemTrack: CaptureTrack?
+
     public private(set) var configuration: Configuration?
-    public private(set) var sampleRate: Double = 48_000
-    /// Interleaved output channel count (2 or 4).
-    public private(set) var outputChannels: Int = 0
     public private(set) var hasMic = false
     public private(set) var hasSystemAudio = false
 
@@ -62,47 +59,34 @@ public final class CaptureEngine: @unchecked Sendable {
     private var tapProcID: AudioDeviceIOProcID?
     private var tapStarted = false
 
-    /// System audio handed from the tap path to the mic (master) path.
-    private var tapRing: RingBuffer?
+    // MARK: Scratch (preallocated; the IO paths never allocate)
 
-    // MARK: Scratch buffers (preallocated; the IO paths never allocate)
-
-    /// Interleaved output frames assembled by the master path.
-    private var outputScratch: UnsafeMutablePointer<Float>?
-    /// Stereo extraction buffer for the mic path.
     private var micScratch: UnsafeMutablePointer<Float>?
-    /// Stereo extraction buffer for the tap path.
     private var tapScratch: UnsafeMutablePointer<Float>?
 
-    /// Destinations for captured audio while recording. Guarded by `sinksLock`.
-    private var sinks: [RingBuffer] = []
-    private let sinksLock: UnsafeMutablePointer<os_unfair_lock_s>
-
-    private let droppedFrames = Atomic<Int>(0)
     private let logger = Logger(subsystem: "dev.cmatskas.AudioRecorder", category: "capture")
-    private let micCallbacks = Atomic<Int>(0)
-    private let tapCallbacks = Atomic<Int>(0)
 
-    public init() {
-        sinksLock = UnsafeMutablePointer<os_unfair_lock_s>.allocate(capacity: 1)
-        sinksLock.initialize(to: os_unfair_lock_s())
-    }
+    public init() {}
 
     deinit {
         stop()
         teardown()
-        outputScratch?.deallocate()
         micScratch?.deallocate()
         tapScratch?.deallocate()
-        sinksLock.deallocate()
     }
 
-    public var framesDropped: Int { droppedFrames.load(ordering: .relaxed) }
+    /// The highest sample rate among active tracks — the rate a merged
+    /// recording will be produced at.
+    public var mergedSampleRate: Double {
+        max(micTrack?.sampleRate ?? 0, systemTrack?.sampleRate ?? 0)
+    }
 
-    /// IO callback counts, useful for diagnosing a stalled capture path
-    /// without logging from the real-time threads.
-    public var callbackCounts: (mic: Int, systemAudio: Int) {
-        (micCallbacks.load(ordering: .relaxed), tapCallbacks.load(ordering: .relaxed))
+    public var framesDropped: Int {
+        (micTrack?.framesDropped ?? 0) + (systemTrack?.framesDropped ?? 0)
+    }
+
+    public var framesGapFilled: Int {
+        (micTrack?.framesGapFilled ?? 0) + (systemTrack?.framesGapFilled ?? 0)
     }
 
     // MARK: - Lifecycle
@@ -123,16 +107,19 @@ public final class CaptureEngine: @unchecked Sendable {
                 throw CoreAudioError.osStatus(-1, "locating microphone '\(mic.name)'")
             }
             micDeviceID = resolved
-            sampleRate = (try? caGetValue(
+            let rate = (try? caGetValue(
                 resolved,
                 kAudioDevicePropertyNominalSampleRate,
                 initial: Double(48_000),
                 what: "reading microphone sample rate"
             )) ?? 48_000
+            micTrack = CaptureTrack(label: "mic", sampleRate: rate)
         }
 
         // 2. System audio: process tap inside an aggregate paired with the
-        //    tapped output device (which drives that aggregate's IO cycle).
+        //    tapped output device, which drives that aggregate's IO cycle.
+        //    The aggregate keeps its own native rate — it is no longer forced
+        //    to match the mic, since merging happens offline.
         if config.captureSystemAudio {
             let description = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
             description.name = "AudioRecorder System Audio Tap"
@@ -176,46 +163,21 @@ public final class CaptureEngine: @unchecked Sendable {
             )
             tapAggregateID = newAggregateID
 
-            if config.micDevice == nil {
-                // No mic: the tap path defines the session rate.
-                sampleRate = (try? caGetValue(
-                    newAggregateID,
-                    kAudioDevicePropertyNominalSampleRate,
-                    initial: Double(48_000),
-                    what: "reading aggregate sample rate"
-                )) ?? 48_000
-            } else {
-                // Align the tap aggregate to the mic clock rate so merged
-                // frames share a timebase; the tap is drift-compensated and
-                // resampled onto it.
-                var rate = sampleRate
-                var address = caAddress(kAudioDevicePropertyNominalSampleRate)
-                let status = AudioObjectSetPropertyData(
-                    newAggregateID, &address, 0, nil,
-                    UInt32(MemoryLayout<Double>.size), &rate
-                )
-                if status != noErr {
-                    logger.warning("could not align tap aggregate to \(rate, privacy: .public) Hz (status \(status, privacy: .public))")
-                }
-            }
+            let rate = (try? caGetValue(
+                newAggregateID,
+                kAudioDevicePropertyNominalSampleRate,
+                initial: Double(48_000),
+                what: "reading aggregate sample rate"
+            )) ?? 48_000
+            systemTrack = CaptureTrack(label: "system", sampleRate: rate)
         }
 
-        outputChannels = (hasMic ? 2 : 0) + (hasSystemAudio ? 2 : 0)
-
-        // 3. Preallocate scratch and the cross-path handoff ring (2 seconds).
-        outputScratch?.deallocate()
         micScratch?.deallocate()
         tapScratch?.deallocate()
-        outputScratch = .allocate(capacity: Self.maxFramesPerCycle * outputChannels)
         micScratch = .allocate(capacity: Self.maxFramesPerCycle * 2)
         tapScratch = .allocate(capacity: Self.maxFramesPerCycle * 2)
-        tapRing = (hasMic && hasSystemAudio)
-            ? RingBuffer(capacityFloats: Int(sampleRate * 2) * 2)
-            : nil
 
-        micCallbacks.store(0, ordering: .relaxed)
-        tapCallbacks.store(0, ordering: .relaxed)
-        logger.info("prepare: mic=\(config.micDevice?.name ?? "none", privacy: .public) tap=\(config.captureSystemAudio, privacy: .public) outputChannels=\(self.outputChannels, privacy: .public) rate=\(self.sampleRate, privacy: .public)")
+        logger.info("prepare: mic=\(config.micDevice?.name ?? "none", privacy: .public) micRate=\(self.micTrack?.sampleRate ?? 0, privacy: .public) tap=\(config.captureSystemAudio, privacy: .public) tapRate=\(self.systemTrack?.sampleRate ?? 0, privacy: .public)")
 
         configuration = config
     }
@@ -227,8 +189,8 @@ public final class CaptureEngine: @unchecked Sendable {
             var procID: AudioDeviceIOProcID?
             try caCheck(
                 AudioDeviceCreateIOProcIDWithBlock(&procID, micDeviceID, nil) {
-                    [unowned self] _, inputData, _, _, _ in
-                    self.handleMicInput(inputData)
+                    [unowned self] _, inputData, inputTime, _, _ in
+                    self.handleMicInput(inputData, inputTime)
                 },
                 "creating microphone IO proc"
             )
@@ -241,8 +203,8 @@ public final class CaptureEngine: @unchecked Sendable {
             var procID: AudioDeviceIOProcID?
             try caCheck(
                 AudioDeviceCreateIOProcIDWithBlock(&procID, tapAggregateID, nil) {
-                    [unowned self] _, inputData, _, _, _ in
-                    self.handleTapInput(inputData)
+                    [unowned self] _, inputData, inputTime, _, _ in
+                    self.handleTapInput(inputData, inputTime)
                 },
                 "creating system audio IO proc"
             )
@@ -280,28 +242,21 @@ public final class CaptureEngine: @unchecked Sendable {
             tapID = AudioObjectID(kAudioObjectUnknown)
         }
         micDeviceID = AudioObjectID(kAudioObjectUnknown)
+        micTrack = nil
+        systemTrack = nil
         configuration = nil
-        outputChannels = 0
-        tapRing = nil
     }
 
-    // MARK: - Sinks
-
-    /// Attach ring buffers that should receive captured audio (recording on).
-    public func setSinks(_ newSinks: [RingBuffer]) {
-        os_unfair_lock_lock(sinksLock)
-        sinks = newSinks
-        os_unfair_lock_unlock(sinksLock)
-        if !newSinks.isEmpty {
-            droppedFrames.store(0, ordering: .relaxed)
-        }
+    /// Attaches recording destinations per source. Empty arrays detach.
+    public func setSinks(mic: [RingBuffer], system: [RingBuffer]) {
+        micTrack?.setSinks(mic)
+        systemTrack?.setSinks(system)
     }
 
     // MARK: - Real-time paths
 
-    /// Extracts interleaved stereo from a device's input buffer list.
-    /// Mono sources are duplicated; multi-channel sources use the first two
-    /// channels. Returns the frame count written to `dest`.
+    /// Extracts interleaved stereo from a device's input buffer list. Mono
+    /// sources are duplicated; multi-channel sources use the first two channels.
     @inline(__always)
     private func extractStereo(
         from bufferList: UnsafeMutableAudioBufferListPointer,
@@ -362,93 +317,40 @@ public final class CaptureEngine: @unchecked Sendable {
         }
     }
 
-    /// Microphone IOProc. Master path when a mic is present: assembles output
-    /// frames and merges whatever system audio has arrived.
-    private func handleMicInput(_ inputData: UnsafePointer<AudioBufferList>) {
-        guard let micScratch, let outputScratch else { return }
+    @inline(__always)
+    private func hostTime(from timestamp: UnsafePointer<AudioTimeStamp>) -> UInt64 {
+        let stamp = timestamp.pointee
+        if stamp.mFlags.contains(.hostTimeValid) {
+            return stamp.mHostTime
+        }
+        return mach_absolute_time()
+    }
+
+    private func handleMicInput(
+        _ inputData: UnsafePointer<AudioBufferList>,
+        _ inputTime: UnsafePointer<AudioTimeStamp>
+    ) {
+        guard let micScratch, let micTrack else { return }
         let bufferList = UnsafeMutableAudioBufferListPointer(
             UnsafeMutablePointer(mutating: inputData)
         )
         let frames = extractStereo(from: bufferList, into: micScratch)
         guard frames > 0 else { return }
-
-        // Counters only: os_log is not real-time safe, so the IO paths never log.
-        _ = micCallbacks.wrappingAdd(1, ordering: .relaxed)
         publishMeter(micScratch, frames: frames, isMic: true)
-
-        let channelCount = outputChannels
-        if channelCount == 2 {
-            // Mic only.
-            memcpy(outputScratch, micScratch, frames * 2 * MemoryLayout<Float>.size)
-        } else {
-            // Mic + system audio: interleave the mic pair with system frames
-            // pulled from the tap path, zero-filling when the tap is idle.
-            var systemFrames = 0
-            if let tapRing, let tapScratch {
-                let wanted = frames * 2
-                // Bound latency: if the tap path has run ahead, discard the
-                // backlog beyond a few cycles rather than drifting behind.
-                let backlogLimit = wanted * 4
-                if tapRing.availableToRead > backlogLimit {
-                    var excess = tapRing.availableToRead - backlogLimit
-                    while excess > 0 {
-                        let chunk = min(excess, Self.maxFramesPerCycle * 2)
-                        let drained = tapRing.read(into: tapScratch, maxCount: chunk)
-                        if drained == 0 { break }
-                        excess -= drained
-                    }
-                }
-                systemFrames = tapRing.read(into: tapScratch, maxCount: wanted) / 2
-            }
-            for frame in 0..<frames {
-                let out = frame * channelCount
-                outputScratch[out] = micScratch[frame * 2]
-                outputScratch[out + 1] = micScratch[frame * 2 + 1]
-                if frame < systemFrames, let tapScratch {
-                    outputScratch[out + 2] = tapScratch[frame * 2]
-                    outputScratch[out + 3] = tapScratch[frame * 2 + 1]
-                } else {
-                    outputScratch[out + 2] = 0
-                    outputScratch[out + 3] = 0
-                }
-            }
-        }
-
-        writeToSinks(outputScratch, floats: frames * channelCount, frames: frames)
+        micTrack.append(micScratch, frameCount: frames, hostTime: hostTime(from: inputTime))
     }
 
-    /// System audio IOProc. Publishes its own meter (so system levels are
-    /// independent of the mic) and either hands frames to the mic master path
-    /// or writes directly when it is the only source.
-    private func handleTapInput(_ inputData: UnsafePointer<AudioBufferList>) {
-        guard let tapScratch else { return }
+    private func handleTapInput(
+        _ inputData: UnsafePointer<AudioBufferList>,
+        _ inputTime: UnsafePointer<AudioTimeStamp>
+    ) {
+        guard let tapScratch, let systemTrack else { return }
         let bufferList = UnsafeMutableAudioBufferListPointer(
             UnsafeMutablePointer(mutating: inputData)
         )
         let frames = extractStereo(from: bufferList, into: tapScratch)
         guard frames > 0 else { return }
-
-        let count = tapCallbacks.wrappingAdd(1, ordering: .relaxed)
-        _ = count
         publishMeter(tapScratch, frames: frames, isMic: false)
-
-        if let tapRing {
-            // Mic is master; hand off for merging.
-            tapRing.write(tapScratch, count: frames * 2)
-        } else {
-            // System audio only.
-            writeToSinks(tapScratch, floats: frames * 2, frames: frames)
-        }
-    }
-
-    @inline(__always)
-    private func writeToSinks(_ data: UnsafePointer<Float>, floats: Int, frames: Int) {
-        os_unfair_lock_lock(sinksLock)
-        for sink in sinks {
-            if !sink.write(data, count: floats) {
-                _ = droppedFrames.wrappingAdd(frames, ordering: .relaxed)
-            }
-        }
-        os_unfair_lock_unlock(sinksLock)
+        systemTrack.append(tapScratch, frameCount: frames, hostTime: hostTime(from: inputTime))
     }
 }

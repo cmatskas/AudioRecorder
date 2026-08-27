@@ -1,17 +1,26 @@
 import Foundation
 import Synchronization
 
-/// Coordinates one recording: captures from a `CaptureEngine` and writes to
-/// one or two destinations (the always-on backup, plus an optional
-/// user-chosen destination), each with its own ring buffer and writer thread
-/// so a slow or failing destination can never stall the other — or the
-/// audio thread.
+/// Coordinates one recording: captures from a `CaptureEngine` and writes every
+/// source to every destination.
+///
+/// The layout is destinations × sources. Each pair gets its own ring buffer and
+/// its own writer thread, so nothing is coupled:
+///
+///  - a slow or failing destination cannot stall the other destination,
+///  - a stalling source (a Bluetooth dropout, say) cannot stall the other
+///    source, and cannot stall the audio thread,
+///  - the always-on backup destination survives failures of the user-chosen one.
+///
+/// Sources are written as separate PCM masters at their native rates and merged
+/// offline in `SessionEncoder`, which is also the path crash recovery uses.
 public final class RecordingSession: @unchecked Sendable {
     public struct Result: Sendable {
         public let backupM4A: URL?
         public let userM4A: URL?
         public let sessionDirectory: URL
         public let framesDropped: Int
+        public let framesGapFilled: Int
         public let warnings: [String]
     }
 
@@ -26,67 +35,98 @@ public final class RecordingSession: @unchecked Sendable {
         }
     }
 
+    /// One source's pipeline into one destination.
+    private final class Lane {
+        let sourceLabel: String
+        let ring: RingBuffer
+        let writer: TrackWriter
+        let done = DispatchSemaphore(value: 0)
+        let failure = Mutex<String?>(nil)
+
+        init(sourceLabel: String, ring: RingBuffer, writer: TrackWriter) {
+            self.sourceLabel = sourceLabel
+            self.ring = ring
+            self.writer = writer
+        }
+    }
+
     private final class Destination {
         let label: String
         let root: URL
-        let ring: RingBuffer
-        let writer: SessionWriter
-        let done = DispatchSemaphore(value: 0)
-        var thread: Thread?
-        let failure = Mutex<String?>(nil)
-        /// Whether this is the user-selected destination (cleaned up after encode).
+        let store: SessionStore
         let isUserDestination: Bool
+        var lanes: [Lane] = []
 
-        init(label: String, root: URL, ring: RingBuffer, writer: SessionWriter, isUserDestination: Bool) {
+        init(label: String, root: URL, store: SessionStore, isUserDestination: Bool) {
             self.label = label
             self.root = root
-            self.ring = ring
-            self.writer = writer
+            self.store = store
             self.isUserDestination = isUserDestination
         }
     }
 
     public let sessionName: String
     private let engine: CaptureEngine
-    private let channels: Int
+    private let tracks: [CaptureTrack]
     private var destinations: [Destination] = []
     private let stopRequested = Atomic<Bool>(false)
     private var started = false
+    private var initWarnings: [String] = []
 
-    /// Ring capacity: 30 seconds of headroom per destination.
+    /// Ring capacity per lane: 30 seconds of headroom.
     private static let ringSeconds = 30.0
 
     public init(
         engine: CaptureEngine,
         backupRoot: URL,
         userDestinationRoot: URL?,
-        micName: String?,
-        systemAudio: Bool
+        micName: String?
     ) throws {
         self.engine = engine
-        self.channels = engine.outputChannels
+        tracks = [engine.micTrack, engine.systemTrack].compactMap { $0 }
+        guard !tracks.isEmpty else {
+            throw CoreAudioError.osStatus(-1, "starting recording: no active sources")
+        }
 
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
         sessionName = "recording_\(formatter.string(from: Date()))"
 
-        let ringCapacity = Int(Self.ringSeconds * engine.sampleRate) * channels
+        let manifestTracks = tracks.map { track in
+            SessionManifest.Track(
+                label: track.label,
+                sampleRate: track.sampleRate,
+                channels: track.channels,
+                hostTicksPerSecond: track.ticksPerSecond
+            )
+        }
 
         func makeDestination(label: String, root: URL, isUser: Bool) throws -> Destination {
-            Destination(
-                label: label,
-                root: root,
-                ring: RingBuffer(capacityFloats: ringCapacity),
-                writer: try SessionWriter(
-                    destinationRoot: root,
-                    sessionName: sessionName,
-                    sampleRate: engine.sampleRate,
-                    channels: channels,
-                    micName: micName,
-                    systemAudio: systemAudio
-                ),
-                isUserDestination: isUser
+            let store = try SessionStore(
+                destinationRoot: root,
+                sessionName: sessionName,
+                micName: micName,
+                tracks: manifestTracks
             )
+            let destination = Destination(
+                label: label, root: root, store: store, isUserDestination: isUser
+            )
+            for track in tracks {
+                let capacity = Int(Self.ringSeconds * track.sampleRate) * track.channels
+                destination.lanes.append(
+                    Lane(
+                        sourceLabel: track.label,
+                        ring: RingBuffer(capacityFloats: capacity),
+                        writer: try TrackWriter(
+                            store: store,
+                            label: track.label,
+                            sampleRate: track.sampleRate,
+                            channels: track.channels
+                        )
+                    )
+                )
+            }
+            return destination
         }
 
         destinations.append(try makeDestination(label: "backup", root: backupRoot, isUser: false))
@@ -97,7 +137,6 @@ public final class RecordingSession: @unchecked Sendable {
                     try makeDestination(label: "primary", root: userRoot, isUser: true)
                 )
             } catch {
-                // The backup destination alone is enough to record; surface later.
                 initWarnings.append(
                     "Could not write to the chosen destination (\(error.localizedDescription)). Recording to backup only."
                 )
@@ -105,78 +144,117 @@ public final class RecordingSession: @unchecked Sendable {
         }
     }
 
-    private var initWarnings: [String] = []
-
     // MARK: - Lifecycle
 
     public func start() {
         guard !started else { return }
         started = true
 
-        for index in destinations.indices {
-            let destination = destinations[index]
-            let ring = destination.ring
-            let writer = destination.writer
-            let done = destination.done
-            let channelCount = channels
-
-            let thread = Thread { [self] in
-                let chunkFrames = 16384
-                let capacityFloats = chunkFrames * channelCount
-                let buffer = UnsafeMutablePointer<Float>.allocate(capacity: capacityFloats)
-                defer { buffer.deallocate() }
-
-                var failed = false
-                while true {
-                    let floats = ring.read(into: buffer, maxCount: capacityFloats)
-                    if floats > 0 {
-                        if !failed {
-                            do {
-                                try writer.append(buffer, frameCount: floats / channelCount)
-                            } catch {
-                                failed = true
-                                destination.failure.withLock { $0 = error.localizedDescription }
-                            }
-                        }
-                    } else if stopRequested.load(ordering: .acquiring) {
-                        break
-                    } else {
-                        usleep(10_000)
-                    }
+        for destination in destinations {
+            for lane in destination.lanes {
+                let thread = Thread { [self] in
+                    drain(lane: lane, channels: 2)
                 }
-                if !failed {
-                    do {
-                        try writer.finish()
-                    } catch {
-                        destination.failure.withLock { $0 = error.localizedDescription }
-                    }
-                }
-                done.signal()
+                thread.name = "TrackWriter-\(destination.label)-\(lane.sourceLabel)"
+                thread.qualityOfService = .userInitiated
+                thread.start()
             }
-            thread.name = "SessionWriter-\(destination.label)"
-            thread.qualityOfService = .userInitiated
-            thread.start()
-            destinations[index].thread = thread
         }
 
-        engine.setSinks(destinations.map(\.ring))
+        // Attach each source to the matching lane in every destination.
+        engine.setSinks(
+            mic: rings(forSource: "mic"),
+            system: rings(forSource: "system")
+        )
     }
 
-    /// Stops capture, drains and finalizes all destinations, encodes the final
-    /// `.m4a`, and copies it to the user destination. Blocking; call off-main.
+    private func rings(forSource label: String) -> [RingBuffer] {
+        destinations.flatMap { destination in
+            destination.lanes.filter { $0.sourceLabel == label }.map(\.ring)
+        }
+    }
+
+    private func drain(lane: Lane, channels: Int) {
+        let chunkFrames = 16384
+        let capacityFloats = chunkFrames * channels
+        let buffer = UnsafeMutablePointer<Float>.allocate(capacity: capacityFloats)
+        defer { buffer.deallocate() }
+
+        var failed = false
+        while true {
+            let floats = lane.ring.read(into: buffer, maxCount: capacityFloats)
+            if floats > 0 {
+                if !failed {
+                    do {
+                        try lane.writer.append(buffer, frameCount: floats / channels)
+                    } catch {
+                        failed = true
+                        lane.failure.withLock { $0 = error.localizedDescription }
+                    }
+                }
+            } else if stopRequested.load(ordering: .acquiring) {
+                break
+            } else {
+                usleep(10_000)
+            }
+        }
+        if !failed {
+            do {
+                try lane.writer.finish()
+            } catch {
+                lane.failure.withLock { $0 = error.localizedDescription }
+            }
+        }
+        lane.done.signal()
+    }
+
+    /// Stops capture, drains and finalizes every lane, records the host-time
+    /// anchors, renders the merged `.m4a`, and copies it to the user
+    /// destination. Blocking; call off the main thread.
     public func stopAndFinalize() throws -> Result {
-        engine.setSinks([])
+        engine.setSinks(mic: [], system: [])
         stopRequested.store(true, ordering: .releasing)
         for destination in destinations {
-            destination.done.wait()
+            for lane in destination.lanes {
+                lane.done.wait()
+            }
         }
 
         var warnings = initWarnings
+
+        // Persist anchors so the offline merge can align the tracks.
+        for destination in destinations {
+            for track in tracks {
+                do {
+                    try destination.store.setAnchor(
+                        track.anchorHostTime,
+                        ticksPerSecond: track.ticksPerSecond,
+                        forTrack: track.label
+                    )
+                } catch {
+                    warnings.append(
+                        "Could not record timing anchor for \(track.label): \(error.localizedDescription)"
+                    )
+                }
+            }
+        }
+
+        // A destination is healthy if at least one of its lanes wrote cleanly.
         var healthy: [Destination] = []
         for destination in destinations {
-            if let reason = destination.failure.withLock({ $0 }) {
-                warnings.append("Destination '\(destination.label)' failed: \(reason)")
+            let failures = destination.lanes.compactMap { lane in
+                lane.failure.withLock { $0 }.map { "\(lane.sourceLabel): \($0)" }
+            }
+            if failures.count == destination.lanes.count {
+                warnings.append(
+                    "Destination '\(destination.label)' failed: \(failures.joined(separator: "; "))"
+                )
             } else {
+                if !failures.isEmpty {
+                    warnings.append(
+                        "Destination '\(destination.label)' partially failed: \(failures.joined(separator: "; "))"
+                    )
+                }
                 healthy.append(destination)
             }
         }
@@ -184,13 +262,16 @@ public final class RecordingSession: @unchecked Sendable {
             throw SessionError.allWritersFailed(warnings)
         }
 
-        // Encode once from the first healthy destination's PCM masters.
-        let manifest = canonical.writer.currentManifest
+        for destination in healthy {
+            try? destination.store.setStatus(.complete)
+        }
+
+        // Encode once from the canonical destination's PCM masters.
         let m4aName = "\(sessionName).m4a"
-        let encodedURL = canonical.writer.sessionDirectory.appendingPathComponent(m4aName)
+        let encodedURL = canonical.store.directory.appendingPathComponent(m4aName)
         try SessionEncoder.encode(
-            sessionDirectory: canonical.writer.sessionDirectory,
-            manifest: manifest,
+            sessionDirectory: canonical.store.directory,
+            manifest: canonical.store.currentManifest,
             outputURL: encodedURL
         )
 
@@ -198,25 +279,25 @@ public final class RecordingSession: @unchecked Sendable {
         var userM4A: URL?
         for destination in healthy {
             if destination.isUserDestination {
-                // User side gets the .m4a at the root of their chosen folder;
-                // its live PCM copy is then redundant and removed.
+                // The user destination receives the finished .m4a at the root of
+                // their chosen folder; its live PCM copy is then redundant.
                 let target = destination.root.appendingPathComponent(m4aName)
                 do {
                     try? FileManager.default.removeItem(at: target)
                     try FileManager.default.copyItem(at: encodedURL, to: target)
                     userM4A = target
-                    if destination.writer.sessionDirectory != canonical.writer.sessionDirectory {
-                        try? FileManager.default.removeItem(at: destination.writer.sessionDirectory)
+                    if destination.store.directory != canonical.store.directory {
+                        try? FileManager.default.removeItem(at: destination.store.directory)
                     }
                 } catch {
-                    warnings.append("Could not copy recording to destination: \(error.localizedDescription)")
+                    warnings.append(
+                        "Could not copy recording to destination: \(error.localizedDescription)"
+                    )
                 }
             } else {
                 backupM4A = encodedURL
             }
         }
-        // If the backup writer failed but the user one survived, the encode
-        // lives in the user session directory.
         if backupM4A == nil && userM4A == nil {
             userM4A = encodedURL
         }
@@ -225,12 +306,19 @@ public final class RecordingSession: @unchecked Sendable {
         if dropped > 0 {
             warnings.append("\(dropped) audio frames were dropped (destination too slow)")
         }
+        let gapFilled = engine.framesGapFilled
+        if gapFilled > 0 {
+            warnings.append(
+                "\(gapFilled) frames of silence were inserted to cover device dropouts"
+            )
+        }
 
         return Result(
             backupM4A: backupM4A,
             userM4A: userM4A,
-            sessionDirectory: canonical.writer.sessionDirectory,
+            sessionDirectory: canonical.store.directory,
             framesDropped: dropped,
+            framesGapFilled: gapFilled,
             warnings: warnings
         )
     }

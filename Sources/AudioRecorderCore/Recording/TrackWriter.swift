@@ -1,58 +1,41 @@
 import Foundation
 
-/// Owns one destination's on-disk representation of a recording session:
-/// a directory containing CAF segments plus a `session.json` manifest.
+/// Writes one capture source's CAF segments into a session directory.
 ///
-/// Durability policy:
-///  - audio is appended continuously (never buffered in memory beyond the ring),
-///  - `F_FULLFSYNC` every `syncInterval` seconds bounds power-loss data loss,
-///  - segments roll every `segmentDuration` seconds so all but the live
-///    segment are fully finalized files,
-///  - the manifest records each segment the moment it is opened, so recovery
-///    always knows what exists.
-public final class SessionWriter {
-    public let sessionDirectory: URL
+/// Durability policy (unchanged from the single-stream design, now applied per
+/// source): audio is appended continuously, `F_FULLFSYNC` runs every
+/// `syncInterval` seconds to bound loss on power failure, segments roll every
+/// `segmentDuration` seconds so all but the live segment are complete files,
+/// and each segment is registered with the session store the moment it is
+/// opened so recovery always knows what exists.
+public final class TrackWriter {
+    public let label: String
     public let sampleRate: Double
     public let channels: Int
 
-    /// Roll to a new segment every 10 minutes.
+    private let store: SessionStore
     private let segmentFrames: Int
-    /// Force data to media every 5 seconds.
     private let syncFrames: Int
 
-    private var manifest: SessionManifest
     private var currentSegment: CAFWriter?
     private var segmentIndex = 0
     private var framesInSegment = 0
     private var framesSinceSync = 0
 
     public init(
-        destinationRoot: URL,
-        sessionName: String,
+        store: SessionStore,
+        label: String,
         sampleRate: Double,
-        channels: Int,
-        micName: String?,
-        systemAudio: Bool,
+        channels: Int = 2,
         segmentDuration: TimeInterval = 600,
         syncInterval: TimeInterval = 5
     ) throws {
-        sessionDirectory = destinationRoot.appendingPathComponent(sessionName, isDirectory: true)
+        self.store = store
+        self.label = label
         self.sampleRate = sampleRate
         self.channels = channels
         segmentFrames = max(1, Int(segmentDuration * sampleRate))
         syncFrames = max(1, Int(syncInterval * sampleRate))
-
-        try FileManager.default.createDirectory(
-            at: sessionDirectory,
-            withIntermediateDirectories: true
-        )
-        manifest = SessionManifest(
-            name: sessionName,
-            sampleRate: sampleRate,
-            channels: channels,
-            micName: micName,
-            systemAudio: systemAudio
-        )
         try openNextSegment()
     }
 
@@ -71,30 +54,25 @@ public final class SessionWriter {
         }
     }
 
-    /// Finalizes the live segment and marks the session complete.
+    /// Finalizes the live segment. The session status is owned by the store.
     public func finish() throws {
         try currentSegment?.finalize()
         currentSegment = nil
-        manifest.status = .complete
-        try manifest.save(to: sessionDirectory)
     }
-
-    public var currentManifest: SessionManifest { manifest }
 
     // MARK: - Segments
 
     private func openNextSegment() throws {
         segmentIndex += 1
-        let name = String(format: "segment_%03d.caf", segmentIndex)
+        let name = String(format: "%@_%03d.caf", label, segmentIndex)
         currentSegment = try CAFWriter(
-            url: sessionDirectory.appendingPathComponent(name),
+            url: store.directory.appendingPathComponent(name),
             sampleRate: sampleRate,
             channels: channels
         )
         framesInSegment = 0
         framesSinceSync = 0
-        manifest.segments.append(name)
-        try manifest.save(to: sessionDirectory)
+        try store.addSegment(name, toTrack: label)
     }
 
     private func rollSegment() throws {

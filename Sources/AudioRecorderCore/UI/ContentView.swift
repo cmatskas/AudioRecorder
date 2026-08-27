@@ -59,7 +59,8 @@ public struct ContentView: View {
                     title: "Microphone",
                     isOn: $state.micEnabled,
                     levels: levels.mic,
-                    enabled: state.micEnabled
+                    enabled: state.micEnabled,
+                    rate: state.micSampleRate
                 ) {
                     Picker("Microphone", selection: $state.selectedMicUID) {
                         ForEach(state.devices) { device in
@@ -74,7 +75,8 @@ public struct ContentView: View {
                     title: "System Audio",
                     isOn: $state.systemAudioEnabled,
                     levels: levels.system,
-                    enabled: state.systemAudioEnabled
+                    enabled: state.systemAudioEnabled,
+                    rate: state.systemSampleRate
                 ) {
                     Text("Everything your Mac plays")
                         .font(.caption)
@@ -92,6 +94,7 @@ public struct ContentView: View {
         isOn: Binding<Bool>,
         levels: (Float, Float),
         enabled: Bool,
+        rate: Double?,
         @ViewBuilder detail: () -> Content
     ) -> some View {
         VStack(spacing: 10) {
@@ -108,6 +111,7 @@ public struct ContentView: View {
             }
             detail()
             StereoVUMeter(title: title, left: levels.0, right: levels.1, enabled: enabled)
+            rateBadge(rate: rate, enabled: enabled)
         }
         .padding(12)
         .frame(maxWidth: .infinity)
@@ -119,6 +123,32 @@ public struct ContentView: View {
             RoundedRectangle(cornerRadius: 10)
                 .strokeBorder(Color.primary.opacity(0.08))
         )
+    }
+
+    /// Shows the capture rate for a source, flagging anything below CD quality
+    /// (typically a Bluetooth microphone) so the limitation is visible here
+    /// rather than discovered in the finished file.
+    @ViewBuilder
+    private func rateBadge(rate: Double?, enabled: Bool) -> some View {
+        if enabled, let rate {
+            let isLow = rate < 44_100
+            HStack(spacing: 4) {
+                if isLow {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.caption2)
+                }
+                Text(String(format: "%.1f kHz", rate / 1000))
+                    .font(.caption.monospacedDigit())
+            }
+            .foregroundStyle(isLow ? .orange : .secondary)
+            .help(
+                isLow
+                    ? "This source is limited to a low sample rate. Recordings follow the highest active source rate."
+                    : "Capture sample rate"
+            )
+        } else {
+            Text(" ").font(.caption)
+        }
     }
 
     // MARK: - Destinations
@@ -197,7 +227,7 @@ public struct ContentView: View {
                     TimelineView(.periodic(from: .now, by: 0.5)) { _ in
                         Text(elapsedText)
                             .font(.system(size: 28, weight: .medium, design: .monospaced))
-                        Text("≈ \(estimatedSizeText) · AAC 192 kbps")
+                        Text("≈ \(estimatedSizeText) · AAC \(outputRateText)")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -267,6 +297,13 @@ public struct ContentView: View {
         let seconds = Date().timeIntervalSince(start)
         let bytes = seconds * 24_000  // 192 kbps AAC
         return ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
+    }
+
+    /// The rate the finished recording will be rendered at — the highest active
+    /// source rate, since nothing is downsampled.
+    private var outputRateText: String {
+        guard let rate = state.sessionSampleRate else { return "192 kbps" }
+        return String(format: "%.1f kHz", rate / 1000)
     }
 
     // MARK: - Banner

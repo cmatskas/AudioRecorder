@@ -25,6 +25,27 @@ public final class AppState: ObservableObject {
     @Published public private(set) var lastSavedURL: URL?
     @Published public private(set) var recoveryItems: [RecoveryManager.RecoveryItem] = []
     @Published public private(set) var userDestination: URL?
+    /// Sample rate of the microphone track, if active.
+    @Published public private(set) var micSampleRate: Double?
+    /// Sample rate of the system audio track, if active.
+    @Published public private(set) var systemSampleRate: Double?
+
+    /// The rate a finished recording will be rendered at (the higher of the
+    /// active sources, since nothing is downsampled).
+    public var sessionSampleRate: Double? {
+        let rates = [micSampleRate, systemSampleRate].compactMap { $0 }
+        return rates.max()
+    }
+
+    /// Set when a source is limited to a low rate (typically a Bluetooth mic),
+    /// so the UI can say so rather than letting it be discovered in the file.
+    public var lowRateWarning: String? {
+        guard let micRate = micSampleRate, micRate < 44_100 else { return nil }
+        let name = selectedMic?.name ?? "Microphone"
+        return String(
+            format: "%@ is limited to %.0f kHz", name, micRate / 1000
+        )
+    }
 
     // MARK: - Internals
 
@@ -134,6 +155,8 @@ public final class AppState: ObservableObject {
         let oldEngine = engine
         engine = nil
         meterRef = nil
+        micSampleRate = nil
+        systemSampleRate = nil
 
         let config = CaptureEngine.Configuration(
             micDevice: selectedMic,
@@ -162,6 +185,8 @@ public final class AppState: ObservableObject {
                     }
                     self.engine = newEngine
                     self.meterRef = newEngine.meters
+                    self.micSampleRate = newEngine.micTrack?.sampleRate
+                    self.systemSampleRate = newEngine.systemTrack?.sampleRate
                     self.statusMessage = nil
                 }
             } catch {
@@ -218,8 +243,7 @@ public final class AppState: ObservableObject {
                     engine: engine,
                     backupRoot: backupRoot,
                     userDestinationRoot: userDestination,
-                    micName: selectedMic?.name,
-                    systemAudio: systemAudioEnabled
+                    micName: selectedMic?.name
                 )
                 newSession.start()
                 session = newSession
