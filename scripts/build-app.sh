@@ -6,6 +6,13 @@
 #   scripts/build-app.sh --install   # build and copy to /Applications
 set -euo pipefail
 
+if [[ $EUID -eq 0 ]]; then
+    echo "Error: do not run this script with sudo." >&2
+    echo "It creates root-owned files in dist/ and /Applications that later" >&2
+    echo "builds cannot replace. /Applications is admin-writable; sudo is not needed." >&2
+    exit 1
+fi
+
 cd "$(dirname "$0")/.."
 
 APP_NAME="AudioRecorder"

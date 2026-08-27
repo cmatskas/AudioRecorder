@@ -32,6 +32,14 @@ public final class AppState: ObservableObject {
     private var session: RecordingSession?
     private var stopObservingDevices: (() -> Void)?
     private static let destinationDefaultsKey = "userDestinationPath"
+    /// Serial queue for all engine construction/teardown: tap and aggregate
+    /// device creation are slow, synchronous Core Audio calls (and the first
+    /// tap creation can block on the permission prompt), so they must never
+    /// run on the main thread.
+    private let engineQueue = DispatchQueue(label: "AudioRecorder.engine", qos: .userInitiated)
+    /// Invalidates in-flight engine builds when configuration changes again.
+    private var engineGeneration = 0
+    private var pendingDeviceRefresh: DispatchWorkItem?
 
     public init() {
         backupRoot = FileManager.default.homeDirectoryForCurrentUser
@@ -83,11 +91,30 @@ public final class AppState: ObservableObject {
         devices = AudioDeviceList.inputDevices()
     }
 
+    /// Device-list notifications are debounced and compared against the
+    /// current list. This is essential: creating or destroying our own tap
+    /// and aggregate device fires this notification, and reacting to our own
+    /// churn would rebuild the engine in an infinite loop.
     private func handleDeviceListChange() {
         guard !isRecording else { return }
-        refreshDevices()
+        pendingDeviceRefresh?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.applyDeviceListChange()
+        }
+        pendingDeviceRefresh = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
+    }
+
+    private func applyDeviceListChange() {
+        guard !isRecording else { return }
+        let newDevices = AudioDeviceList.inputDevices()
+        // Our private aggregates are filtered out of the enumeration, so a
+        // notification caused by our own engine rebuild produces an unchanged
+        // list and is ignored here — breaking the feedback loop.
+        guard newDevices != devices else { return }
+        devices = newDevices
         if selectedMicUID == nil || !devices.contains(where: { $0.uid == selectedMicUID }) {
-            selectedMicUID = defaultMicUID()
+            selectedMicUID = defaultMicUID()  // didSet triggers rebuild
         } else {
             rebuildEngine()
         }
@@ -95,7 +122,11 @@ public final class AppState: ObservableObject {
 
     private func rebuildEngine() {
         guard !isRecording else { return }
-        engine?.stop()
+        engineGeneration += 1
+        let generation = engineGeneration
+
+        // Release the current engine off-main; its teardown is also slow.
+        let oldEngine = engine
         engine = nil
         meterRef = nil
 
@@ -104,18 +135,36 @@ public final class AppState: ObservableObject {
             captureSystemAudio: systemAudioEnabled
         )
         guard config.micDevice != nil || config.captureSystemAudio else {
+            engineQueue.async { oldEngine?.stop() }
             statusMessage = "Select a microphone or enable system audio"
             return
         }
-        let newEngine = CaptureEngine()
-        do {
-            try newEngine.prepare(config)
-            try newEngine.start()
-            engine = newEngine
-            meterRef = newEngine.meters
-            statusMessage = nil
-        } catch {
-            errorMessage = error.localizedDescription
+
+        engineQueue.async { [weak self] in
+            oldEngine?.stop()
+            // oldEngine is released here, so its aggregate/tap teardown
+            // happens on this queue, not on the main thread.
+
+            let newEngine = CaptureEngine()
+            do {
+                try newEngine.prepare(config)
+                try newEngine.start()
+                Task { @MainActor [weak self] in
+                    guard let self, self.engineGeneration == generation else {
+                        // Configuration changed while building; discard.
+                        self?.engineQueue.async { newEngine.stop() }
+                        return
+                    }
+                    self.engine = newEngine
+                    self.meterRef = newEngine.meters
+                    self.statusMessage = nil
+                }
+            } catch {
+                Task { @MainActor [weak self] in
+                    guard let self, self.engineGeneration == generation else { return }
+                    self.errorMessage = error.localizedDescription
+                }
+            }
         }
     }
 
@@ -145,7 +194,10 @@ public final class AppState: ObservableObject {
     }
 
     private func startRecording() {
-        guard let engine else { return }
+        guard let engine else {
+            statusMessage = "Audio engine is still starting — try again in a moment"
+            return
+        }
         errorMessage = nil
         statusMessage = nil
         Task { @MainActor in
