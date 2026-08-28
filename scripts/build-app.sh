@@ -17,7 +17,8 @@ cd "$(dirname "$0")/.."
 
 APP_NAME="AudioRecorder"
 BUNDLE_ID="dev.cmatskas.AudioRecorder"
-VERSION="1.0.0"
+# Stamped from the release tag in CI; defaults for local builds.
+VERSION="${APP_VERSION:-1.0.0}"
 DIST_DIR="dist"
 APP_DIR="$DIST_DIR/$APP_NAME.app"
 

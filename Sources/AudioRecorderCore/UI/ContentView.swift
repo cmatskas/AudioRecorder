@@ -9,6 +9,7 @@ public struct ContentView: View {
     public var body: some View {
         VStack(spacing: 16) {
             header
+            updateBanner
             sourcesSection
             destinationSection
             recordSection
@@ -45,6 +46,48 @@ public struct ContentView: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
+            Text("v\(state.appVersion)")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.tertiary)
+        }
+    }
+
+    // MARK: - Update banner
+
+    @ViewBuilder
+    private var updateBanner: some View {
+        if let update = state.availableUpdate {
+            HStack(spacing: 10) {
+                Image(systemName: "arrow.down.circle.fill")
+                    .foregroundStyle(.blue)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Version \(update.version) is available")
+                        .font(.callout.weight(.medium))
+                    Text("You're running \(state.appVersion)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Download") { state.openUpdatePage() }
+                    .controlSize(.small)
+                    .buttonStyle(.borderedProminent)
+                Button("Skip") { state.skipUpdate() }
+                    .controlSize(.small)
+                Button {
+                    state.dismissUpdate()
+                } label: {
+                    Image(systemName: "xmark").font(.caption2)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .help("Remind me later")
+            }
+            .padding(10)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(Color.blue.opacity(0.12))
+            )
+            .transition(.move(edge: .top).combined(with: .opacity))
         }
     }
 

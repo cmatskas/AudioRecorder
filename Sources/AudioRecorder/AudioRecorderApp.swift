@@ -11,5 +11,12 @@ struct AudioRecorderApp: App {
                 .environmentObject(state)
         }
         .windowResizability(.contentSize)
+        .commands {
+            CommandGroup(after: .appInfo) {
+                Button("Check for Updates…") {
+                    state.checkForUpdates(force: true)
+                }
+            }
+        }
     }
 }

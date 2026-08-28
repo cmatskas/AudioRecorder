@@ -29,6 +29,15 @@ public final class AppState: ObservableObject {
     @Published public private(set) var micSampleRate: Double?
     /// Sample rate of the system audio track, if active.
     @Published public private(set) var systemSampleRate: Double?
+    /// A newer release found on GitHub, if any.
+    @Published public private(set) var availableUpdate: UpdateChecker.Update?
+
+    private let updateChecker = UpdateChecker()
+
+    /// Version of the running app, for display.
+    public var appVersion: String {
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
+    }
 
     /// The rate a finished recording will be rendered at (the higher of the
     /// active sources, since nothing is downsampled).
@@ -83,6 +92,7 @@ public final class AppState: ObservableObject {
         recoveryItems = RecoveryManager.scan(root: backupRoot)
         isInitializing = false
         rebuildEngine()
+        checkForUpdates()
     }
 
     deinit {
@@ -323,6 +333,47 @@ public final class AppState: ObservableObject {
 
     public func openBackupFolder() {
         NSWorkspace.shared.open(backupRoot)
+    }
+
+    // MARK: - Updates
+
+    /// Checks for a newer release. Silent on failure for the automatic check —
+    /// a missing network is not something to interrupt a recording session for.
+    public func checkForUpdates(force: Bool = false) {
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let update = try await self.updateChecker.check(force: force)
+                await MainActor.run {
+                    if let update {
+                        self.availableUpdate = update
+                    } else if force {
+                        self.statusMessage = "You're running the latest version (\(self.appVersion))"
+                    }
+                }
+            } catch {
+                if force {
+                    await MainActor.run {
+                        self.errorMessage = error.localizedDescription
+                    }
+                }
+            }
+        }
+    }
+
+    public func openUpdatePage() {
+        guard let update = availableUpdate else { return }
+        NSWorkspace.shared.open(update.releaseURL)
+    }
+
+    public func skipUpdate() {
+        guard let update = availableUpdate else { return }
+        updateChecker.skip(update)
+        availableUpdate = nil
+    }
+
+    public func dismissUpdate() {
+        availableUpdate = nil
     }
 
     public func revealLastSaved() {

@@ -1,0 +1,165 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v1.0.1)"
+        required: true
+
+# Narrower than granting Actions write access repo-wide.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build, notarize and publish
+    runs-on: macos-15
+    env:
+      APP_NAME: AudioRecorder
+      BUNDLE_ID: dev.cmatskas.AudioRecorder
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select newest Xcode
+        run: |
+          sudo xcode-select --switch /Applications/Xcode.app
+          swift --version
+
+      - name: Resolve version from tag
+        id: version
+        run: |
+          RAW_TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${RAW_TAG#v}"
+          echo "tag=$RAW_TAG"     >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Releasing $RAW_TAG (CFBundleShortVersionString $VERSION)"
+
+      - name: Test
+        run: swift test
+
+      - name: Import Developer ID certificate
+        env:
+          CERT_P12: ${{ secrets.DEVELOPER_ID_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.DEVELOPER_ID_CERT_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # A throwaway keychain, deleted in the cleanup step below.
+          KEYCHAIN_PATH="$RUNNER_TEMP/signing.keychain-db"
+          CERT_PATH="$RUNNER_TEMP/cert.p12"
+
+          echo -n "$CERT_P12" | base64 --decode > "$CERT_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 900 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$CERT_PASSWORD" -A \
+            -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          # Let codesign use the key without an interactive prompt.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" > /dev/null
+          security list-keychain -d user -s "$KEYCHAIN_PATH" login.keychain-db
+
+          rm -f "$CERT_PATH"
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+
+          echo "Available signing identities:"
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+
+      - name: Build signed app bundle
+        env:
+          APP_VERSION: ${{ steps.version.outputs.version }}
+        run: ./scripts/build-app.sh
+
+      - name: Verify signature and hardened runtime
+        run: |
+          set -euo pipefail
+          codesign --verify --deep --strict --verbose=2 "dist/$APP_NAME.app"
+          # Hardened runtime is required for notarization.
+          codesign -dv "dist/$APP_NAME.app" 2>&1 | grep -q "flags=0x10000(runtime)" \
+            || { echo "::error::hardened runtime flag missing"; exit 1; }
+          codesign -dv "dist/$APP_NAME.app" 2>&1 | grep "Authority=Developer ID Application"
+
+      - name: Notarize
+        env:
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          KEY_PATH="$RUNNER_TEMP/asc_key.p8"
+          echo -n "$ASC_KEY_P8" | base64 --decode > "$KEY_PATH"
+
+          # notarytool takes an archive, so submit a zip of the .app.
+          # ditto --keepParent is the only correct way to zip a signed bundle;
+          # `zip` mangles symlinks and extended attributes.
+          ditto -c -k --keepParent "dist/$APP_NAME.app" "$RUNNER_TEMP/notarize.zip"
+
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --key "$KEY_PATH" \
+            --key-id "$ASC_KEY_ID" \
+            --issuer "$ASC_ISSUER_ID" \
+            --wait \
+            --timeout 30m
+
+          rm -f "$KEY_PATH"
+
+      - name: Staple ticket and package
+        run: |
+          set -euo pipefail
+          # Staple the bundle (not the zip) so the app validates offline,
+          # then re-zip for distribution.
+          xcrun stapler staple "dist/$APP_NAME.app"
+          xcrun stapler validate "dist/$APP_NAME.app"
+          spctl --assess --type execute --verbose=2 "dist/$APP_NAME.app"
+          ditto -c -k --keepParent "dist/$APP_NAME.app" "dist/$APP_NAME.zip"
+          shasum -a 256 "dist/$APP_NAME.zip" | tee "dist/$APP_NAME.zip.sha256"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          NOTES="$RUNNER_TEMP/notes.md"
+          {
+            echo "## Audio Recorder $VERSION"
+            echo
+            echo "Records your microphone and your Mac's system audio together."
+            echo "Signed with a Developer ID certificate and notarized by Apple,"
+            echo "so it opens without security warnings."
+            echo
+            echo "### Install"
+            echo
+            echo "1. Download \`$APP_NAME.zip\` below and unzip it."
+            echo "2. Drag \`$APP_NAME.app\` to \`/Applications\`."
+            echo "3. On first recording, grant **Microphone** and **System Audio Recording** permission."
+            echo
+            echo "Requires macOS 15 or later."
+            echo
+            echo "### Verify the download"
+            echo
+            echo '```'
+            echo "shasum -a 256 $APP_NAME.zip"
+            echo "$(cut -d' ' -f1 < "dist/$APP_NAME.zip.sha256")"
+            echo '```'
+          } > "$NOTES"
+
+          gh release create "$TAG" \
+            "dist/$APP_NAME.zip" \
+            "dist/$APP_NAME.zip.sha256" \
+            --title "Audio Recorder $VERSION" \
+            --notes-file "$NOTES" \
+            --verify-tag
+
+      - name: Clean up keychain
+        if: always()
+        run: |
+          if [ -n "${KEYCHAIN_PATH:-}" ] && [ -f "$KEYCHAIN_PATH" ]; then
+            security delete-keychain "$KEYCHAIN_PATH" || true
+          fi
