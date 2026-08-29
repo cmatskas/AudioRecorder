@@ -106,10 +106,20 @@ jobs:
         run: |
           set -euo pipefail
           codesign --verify --deep --strict --verbose=2 "dist/$APP_NAME.app"
+
+          # Authority lines only appear at verbosity 2 or above.
+          DETAILS="$(codesign -dvv "dist/$APP_NAME.app" 2>&1)"
+          echo "$DETAILS"
+
           # Hardened runtime is required for notarization.
-          codesign -dv "dist/$APP_NAME.app" 2>&1 | grep -q "flags=0x10000(runtime)" \
-            || { echo "::error::hardened runtime flag missing"; exit 1; }
-          codesign -dv "dist/$APP_NAME.app" 2>&1 | grep "Authority=Developer ID Application"
+          if ! grep -q "flags=0x10000(runtime)" <<< "$DETAILS"; then
+            echo "::error::Hardened runtime flag missing; notarization would be rejected."
+            exit 1
+          fi
+          if ! grep -q "^Authority=Developer ID Application" <<< "$DETAILS"; then
+            echo "::error::Bundle is not signed with a Developer ID Application certificate."
+            exit 1
+          fi
 
       - name: Notarize
         env:
