@@ -91,7 +91,9 @@ jobs:
           security find-identity -v -p codesigning "$KEYCHAIN_PATH"
           if ! security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
                 | grep -q "Developer ID Application"; then
-            echo "::error::No Developer ID Application identity in the keychain after import. The .p12 may contain only a certificate and not its private key."
+            FOUND="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
+                      | sed -n 's/.*"\(.*\)".*/\1/p' | paste -sd '; ' -)"
+            echo "::error::No 'Developer ID Application' identity after import (found: ${FOUND:-none}). Export the Developer ID Application certificate together with its private key — an 'Apple Development' certificate cannot be notarized, and a certificate exported without its key cannot sign."
             exit 1
           fi
 
