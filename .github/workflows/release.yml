@@ -53,12 +53,32 @@ jobs:
           CERT_PATH="$RUNNER_TEMP/cert.p12"
 
           echo -n "$CERT_P12" | base64 --decode > "$CERT_PATH"
+          if [ ! -s "$CERT_PATH" ]; then
+            echo "::error::DEVELOPER_ID_CERT_P12 decoded to an empty file."
+            exit 1
+          fi
+
+          # A trailing newline in the secret is a common and confusing cause of
+          # "passphrase is not correct", so strip line endings defensively.
+          CERT_PASSWORD="$(printf '%s' "$CERT_PASSWORD" | tr -d '\r\n')"
+          if [ -z "$CERT_PASSWORD" ]; then
+            echo "::error::DEVELOPER_ID_CERT_PASSWORD is empty."
+            exit 1
+          fi
 
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security set-keychain-settings -lut 900 "$KEYCHAIN_PATH"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security import "$CERT_PATH" -P "$CERT_PASSWORD" -A \
-            -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+
+          # No -t filter: the archive holds an identity (certificate *and*
+          # private key) and both must land in the keychain, or codesign later
+          # fails with "no identity found".
+          if ! security import "$CERT_PATH" -P "$CERT_PASSWORD" -A \
+                -f pkcs12 -k "$KEYCHAIN_PATH"; then
+            echo "::error::Could not import the .p12. The most likely cause is that DEVELOPER_ID_CERT_PASSWORD does not match the password used when exporting the certificate. Verify locally with: openssl pkcs12 -in cert.p12 -noout -passin pass:YOURPASSWORD"
+            exit 1
+          fi
+
           # Let codesign use the key without an interactive prompt.
           security set-key-partition-list -S apple-tool:,apple:,codesign: \
             -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" > /dev/null
@@ -69,6 +89,11 @@ jobs:
 
           echo "Available signing identities:"
           security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+          if ! security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
+                | grep -q "Developer ID Application"; then
+            echo "::error::No Developer ID Application identity in the keychain after import. The .p12 may contain only a certificate and not its private key."
+            exit 1
+          fi
 
       - name: Build signed app bundle
         env:
