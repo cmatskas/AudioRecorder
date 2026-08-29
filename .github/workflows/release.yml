@@ -154,7 +154,11 @@ jobs:
           xcrun stapler validate "dist/$APP_NAME.app"
           spctl --assess --type execute --verbose=2 "dist/$APP_NAME.app"
           ditto -c -k --keepParent "dist/$APP_NAME.app" "dist/$APP_NAME.zip"
-          shasum -a 256 "dist/$APP_NAME.zip" | tee "dist/$APP_NAME.zip.sha256"
+          # Generate from inside dist/ so the file records a bare filename;
+          # otherwise `shasum -c` looks for dist/... and fails for anyone who
+          # downloads the two assets side by side.
+          (cd dist && shasum -a 256 "$APP_NAME.zip" > "$APP_NAME.zip.sha256")
+          cat "dist/$APP_NAME.zip.sha256"
 
       - name: Publish release
         env:
