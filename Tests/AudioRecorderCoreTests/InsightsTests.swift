@@ -240,6 +240,51 @@ final class InsightsTests: XCTestCase {
         XCTAssertEqual(readInsights?.suggestions.map(\.text), ["q?"])
     }
 
+    // MARK: - AWS profile parsing
+
+    func testStaticCredentialsParseUppercaseKeysLikeTheCLI() throws {
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("home-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: home.appendingPathComponent(".aws"), withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: home) }
+        // The style Isengard/console credential snippets produce.
+        try """
+        [default]
+        AWS_ACCESS_KEY_ID = AKIAEXAMPLE
+        AWS_SECRET_ACCESS_KEY = secret123
+        AWS_SESSION_TOKEN = token456
+
+        [lowercase]
+        aws_access_key_id = AKIAOTHER
+        aws_secret_access_key = other
+
+        [sso-style]
+        sso_start_url = https://example.awsapps.com/start
+        """.write(
+            to: home.appendingPathComponent(".aws/credentials"),
+            atomically: true, encoding: .utf8
+        )
+
+        let upper = try XCTUnwrap(
+            AWSProfileDiscovery.staticCredentials(forProfile: "default", home: home)
+        )
+        XCTAssertEqual(upper.accessKeyID, "AKIAEXAMPLE")
+        XCTAssertEqual(upper.secretAccessKey, "secret123")
+        XCTAssertEqual(upper.sessionToken, "token456")
+
+        let lower = try XCTUnwrap(
+            AWSProfileDiscovery.staticCredentials(forProfile: "lowercase", home: home)
+        )
+        XCTAssertEqual(lower.accessKeyID, "AKIAOTHER")
+        XCTAssertNil(lower.sessionToken)
+
+        // No inline keys → must return nil so the SDK chain handles it.
+        XCTAssertNil(AWSProfileDiscovery.staticCredentials(forProfile: "sso-style", home: home))
+        XCTAssertNil(AWSProfileDiscovery.staticCredentials(forProfile: "missing", home: home))
+    }
+
     // MARK: - HistoryScanner
 
     func testHistoryScannerFindsCompleteSessionsNewestFirst() throws {

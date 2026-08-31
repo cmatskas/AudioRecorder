@@ -24,6 +24,19 @@ enum AWSCredentials {
     ) throws -> any AWSCredentialIdentityResolver {
         switch configuration.credentialSource {
         case let .profile(name):
+            // Resolve inline keys ourselves (case-insensitive, so console
+            // paste style `AWS_ACCESS_KEY_ID = …` works like it does in the
+            // CLI). Profiles without inline keys — SSO, credential_process,
+            // role assumption — fall through to the SDK's resolver.
+            if let keys = AWSProfileDiscovery.staticCredentials(forProfile: name) {
+                return StaticAWSCredentialIdentityResolver(
+                    AWSCredentialIdentity(
+                        accessKey: keys.accessKeyID,
+                        secret: keys.secretAccessKey,
+                        sessionToken: keys.sessionToken
+                    )
+                )
+            }
             return ProfileAWSCredentialIdentityResolver(profileName: name)
         case .keychain:
             guard let keys = InsightsKeychain().load() else {

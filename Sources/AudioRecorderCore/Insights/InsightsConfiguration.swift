@@ -83,6 +83,62 @@ public enum AWSProfileDiscovery {
         }
         return names
     }
+
+    /// Static credentials read directly from a profile, with **case-insensitive
+    /// key names**. The AWS CLI accepts `AWS_ACCESS_KEY_ID = …` (the style
+    /// pasted from console credential snippets) interchangeably with the
+    /// canonical lowercase form, but strict SDK profile parsers do not — so
+    /// resolving these ourselves keeps such profiles working in the app.
+    /// Returns nil for profiles without inline keys (SSO, credential_process,
+    /// role assumption), which must go through the SDK's own chain.
+    public static func staticCredentials(
+        forProfile profile: String,
+        home: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> (accessKeyID: String, secretAccessKey: String, sessionToken: String?)? {
+        var values: [String: String] = [:]
+        // credentials file wins over config, per AWS precedence.
+        for (file, stripPrefix) in [
+            (home.appendingPathComponent(".aws/config"), true),
+            (home.appendingPathComponent(".aws/credentials"), false),
+        ] {
+            for (key, value) in profileValues(in: file, profile: profile, stripProfilePrefix: stripPrefix) {
+                values[key] = value
+            }
+        }
+        guard
+            let accessKey = values["aws_access_key_id"], !accessKey.isEmpty,
+            let secret = values["aws_secret_access_key"], !secret.isEmpty
+        else { return nil }
+        let token = values["aws_session_token"].flatMap { $0.isEmpty ? nil : $0 }
+        return (accessKey, secret, token)
+    }
+
+    private static func profileValues(
+        in file: URL,
+        profile: String,
+        stripProfilePrefix: Bool
+    ) -> [String: String] {
+        guard let text = try? String(contentsOf: file, encoding: .utf8) else { return [:] }
+        var values: [String: String] = [:]
+        var inSection = false
+        for rawLine in text.split(separator: "\n") {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            if line.hasPrefix("["), line.hasSuffix("]") {
+                var name = String(line.dropFirst().dropLast()).trimmingCharacters(in: .whitespaces)
+                if stripProfilePrefix, name.hasPrefix("profile ") {
+                    name = String(name.dropFirst("profile ".count)).trimmingCharacters(in: .whitespaces)
+                }
+                inSection = name == profile
+                continue
+            }
+            guard inSection, !line.hasPrefix("#"), !line.hasPrefix(";") else { continue }
+            guard let equals = line.firstIndex(of: "=") else { continue }
+            let key = line[..<equals].trimmingCharacters(in: .whitespaces).lowercased()
+            let value = line[line.index(after: equals)...].trimmingCharacters(in: .whitespaces)
+            if !key.isEmpty { values[key] = value }
+        }
+        return values
+    }
 }
 
 /// Keychain-backed storage for manually entered AWS access keys.
