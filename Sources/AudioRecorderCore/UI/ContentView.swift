@@ -2,18 +2,31 @@ import SwiftUI
 
 public struct ContentView: View {
     @EnvironmentObject private var state: AppState
+    @Environment(\.openWindow) private var openWindow
     @State private var showRecoveryAlert = false
+    @State private var tab: Tab = .record
+
+    private enum Tab: Hashable {
+        case record
+        case history
+    }
 
     public init() {}
 
     public var body: some View {
         VStack(spacing: 16) {
             header
-            updateBanner
-            sourcesSection
-            destinationSection
-            recordSection
-            banner
+            tabPicker
+            if tab == .record {
+                updateBanner
+                sourcesSection
+                destinationSection
+                insightsSection
+                recordSection
+                banner
+            } else {
+                HistoryView()
+            }
         }
         .padding(20)
         .frame(width: 520)
@@ -22,6 +35,15 @@ public struct ContentView: View {
             NSApp.activate(ignoringOtherApps: true)
             showRecoveryAlert = !state.recoveryItems.isEmpty
         }
+        .sheet(isPresented: $state.showInsightsSetup) {
+            InsightsSetupSheet()
+                .environmentObject(state)
+        }
+        .onChange(of: state.insightsSessionActive) { _, active in
+            if active {
+                openWindow(id: "insights")
+            }
+        }
         .alert("Interrupted recording found", isPresented: $showRecoveryAlert) {
             Button("Recover") { state.recoverAll() }
             Button("Discard", role: .destructive) { state.discardRecoveryItems() }
@@ -29,6 +51,16 @@ public struct ContentView: View {
         } message: {
             Text(recoveryMessage)
         }
+    }
+
+    private var tabPicker: some View {
+        Picker("", selection: $tab) {
+            Text("Record").tag(Tab.record)
+            Text("History").tag(Tab.history)
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .frame(width: 220)
     }
 
     // MARK: - Header
@@ -257,6 +289,68 @@ public struct ContentView: View {
             .truncationMode(.middle)
             Spacer()
             trailing()
+        }
+    }
+
+    // MARK: - Insights row
+
+    /// One quiet row: the whole surface area of Live Insights for users who
+    /// never enable it. The toggle triggers the setup sheet on first use.
+    private var insightsSection: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "sparkles")
+                .foregroundStyle(state.insightsEnabled ? .purple : .secondary)
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Live insights")
+                    .font(.callout)
+                Text(insightsCaption)
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+            }
+            Spacer()
+            if state.insightsSessionActive {
+                Button("Show window") { openWindow(id: "insights") }
+                    .controlSize(.small)
+            }
+            if state.insightsConfiguration != nil {
+                Button {
+                    state.showInsightsSetup = true
+                } label: {
+                    Image(systemName: "gearshape")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .disabled(state.isRecording)
+                .help("Live Insights settings")
+            }
+            Toggle("", isOn: $state.insightsEnabled)
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .labelsHidden()
+                .disabled(state.isRecording)
+        }
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color(nsColor: .controlBackgroundColor))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(Color.primary.opacity(0.08))
+        )
+    }
+
+    private var insightsCaption: String {
+        guard state.insightsEnabled, let config = state.insightsConfiguration else {
+            return "Transcribe and get follow-up suggestions during recording"
+        }
+        switch config.credentialSource {
+        case let .profile(name):
+            return "On · AWS profile “\(name)” · \(config.region)"
+        case .keychain:
+            return "On · access keys (Keychain) · \(config.region)"
         }
     }
 

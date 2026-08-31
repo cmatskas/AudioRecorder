@@ -1,9 +1,21 @@
 import AudioRecorderCore
+import AudioRecorderInsights
 import SwiftUI
 
 @main
 struct AudioRecorderApp: App {
-    @StateObject private var state = AppState()
+    @StateObject private var state: AppState
+
+    init() {
+        let state = AppState()
+        // The one seam where the dependency-free recording core meets the
+        // AWS-backed insights implementation.
+        state.insightsFactory = { configuration, model in
+            AWSInsightsPipeline(configuration: configuration, model: model)
+        }
+        state.insightsValidator = STSCredentialsValidator()
+        _state = StateObject(wrappedValue: state)
+    }
 
     var body: some Scene {
         WindowGroup("Audio Recorder") {
@@ -18,5 +30,12 @@ struct AudioRecorderApp: App {
                 }
             }
         }
+
+        Window("Live Insights", id: "insights") {
+            InsightsPanelView()
+                .environmentObject(state)
+        }
+        .defaultSize(width: 420, height: 640)
+        .windowResizability(.contentMinSize)
     }
 }

@@ -24,6 +24,21 @@ public final class RecordingSession: @unchecked Sendable {
         public let warnings: [String]
     }
 
+    /// Additional ring buffers attached to the capture sources alongside the
+    /// recording lanes — used by optional consumers such as live analysis.
+    /// They receive the same interleaved stereo frames as the writers but are
+    /// otherwise invisible to the session: a slow or abandoned extra sink
+    /// drops its own data and can never stall recording.
+    public struct ExtraSinks: Sendable {
+        public var mic: [RingBuffer]
+        public var system: [RingBuffer]
+
+        public init(mic: [RingBuffer] = [], system: [RingBuffer] = []) {
+            self.mic = mic
+            self.system = system
+        }
+    }
+
     public enum SessionError: LocalizedError {
         case allWritersFailed([String])
 
@@ -69,6 +84,7 @@ public final class RecordingSession: @unchecked Sendable {
     private let engine: CaptureEngine
     private let tracks: [CaptureTrack]
     private var destinations: [Destination] = []
+    private let extraSinks: ExtraSinks
     private let stopRequested = Atomic<Bool>(false)
     private var started = false
     private var initWarnings: [String] = []
@@ -76,13 +92,21 @@ public final class RecordingSession: @unchecked Sendable {
     /// Ring capacity per lane: 30 seconds of headroom.
     private static let ringSeconds = 30.0
 
+    /// Directory of the backup destination's live session — where optional
+    /// side artifacts (transcripts, insights) should be persisted.
+    public var backupSessionDirectory: URL? {
+        destinations.first(where: { !$0.isUserDestination })?.store.directory
+    }
+
     public init(
         engine: CaptureEngine,
         backupRoot: URL,
         userDestinationRoot: URL?,
-        micName: String?
+        micName: String?,
+        extraSinks: ExtraSinks = ExtraSinks()
     ) throws {
         self.engine = engine
+        self.extraSinks = extraSinks
         tracks = [engine.micTrack, engine.systemTrack].compactMap { $0 }
         guard !tracks.isEmpty else {
             throw CoreAudioError.osStatus(-1, "starting recording: no active sources")
@@ -161,10 +185,11 @@ public final class RecordingSession: @unchecked Sendable {
             }
         }
 
-        // Attach each source to the matching lane in every destination.
+        // Attach each source to the matching lane in every destination, plus
+        // any extra (analysis) sinks.
         engine.setSinks(
-            mic: rings(forSource: "mic"),
-            system: rings(forSource: "system")
+            mic: rings(forSource: "mic") + extraSinks.mic,
+            system: rings(forSource: "system") + extraSinks.system
         )
     }
 

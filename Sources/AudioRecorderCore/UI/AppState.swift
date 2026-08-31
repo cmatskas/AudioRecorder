@@ -32,6 +32,38 @@ public final class AppState: ObservableObject {
     /// A newer release found on GitHub, if any.
     @Published public private(set) var availableUpdate: UpdateChecker.Update?
 
+    // MARK: - Insights state
+
+    /// Live data rendered by the insights window.
+    public let insightsModel = InsightsModel()
+    /// Master switch for live insights; recording never depends on it.
+    @Published public var insightsEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(insightsEnabled, forKey: Self.insightsEnabledKey)
+            if insightsEnabled && insightsConfiguration == nil {
+                // First enable: credentials/region must be set up before the
+                // toggle can take effect.
+                insightsEnabled = false
+                showInsightsSetup = true
+            }
+        }
+    }
+    @Published public var insightsConfiguration: InsightsConfiguration?
+    /// Presents the setup sheet (first enable, or explicit reconfigure).
+    @Published public var showInsightsSetup = false
+    /// True while an insights pipeline is attached to the current recording;
+    /// drives opening of the insights window.
+    @Published public private(set) var insightsSessionActive = false
+    @Published public private(set) var insightsPaused = false
+
+    /// Injected by the app target — the only place Core meets the AWS
+    /// implementation. When nil, the insights UI is inert.
+    public var insightsFactory: InsightsPipelineFactory?
+    public var insightsValidator: (any InsightsCredentialsValidating)?
+
+    private var insightsPipeline: InsightsPipeline?
+    private static let insightsEnabledKey = "insightsEnabled"
+
     private let updateChecker = UpdateChecker()
 
     /// Version of the running app, for display.
@@ -76,6 +108,8 @@ public final class AppState: ObservableObject {
     private var isInitializing = true
 
     public init() {
+        insightsConfiguration = InsightsConfiguration.load()
+        insightsEnabled = UserDefaults.standard.bool(forKey: Self.insightsEnabledKey)
         backupRoot = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("AudioRecorderBackups", isDirectory: true)
         try? FileManager.default.createDirectory(at: backupRoot, withIntermediateDirectories: true)
@@ -249,16 +283,39 @@ public final class AppState: ObservableObject {
                 }
             }
             do {
+                // Optional live-insights tap: prepared before the session so
+                // its rings ride along with the recording sinks. Any failure
+                // here disables insights for this recording, never recording.
+                var extraSinks = RecordingSession.ExtraSinks()
+                var pipeline: InsightsPipeline?
+                if insightsEnabled, let config = insightsConfiguration,
+                   let factory = insightsFactory {
+                    let candidate = factory(config, insightsModel)
+                    extraSinks = candidate.makeExtraSinks(
+                        micRate: engine.micTrack?.sampleRate,
+                        systemRate: engine.systemTrack?.sampleRate
+                    )
+                    pipeline = candidate
+                }
+
                 let newSession = try RecordingSession(
                     engine: engine,
                     backupRoot: backupRoot,
                     userDestinationRoot: userDestination,
-                    micName: selectedMic?.name
+                    micName: selectedMic?.name,
+                    extraSinks: extraSinks
                 )
                 newSession.start()
                 session = newSession
                 isRecording = true
                 recordingStart = Date()
+
+                if let pipeline {
+                    pipeline.start(sessionDirectory: newSession.backupSessionDirectory)
+                    insightsPipeline = pipeline
+                    insightsPaused = false
+                    insightsSessionActive = true
+                }
             } catch {
                 errorMessage = "Could not start recording: \(error.localizedDescription)"
             }
@@ -271,6 +328,8 @@ public final class AppState: ObservableObject {
         isRecording = false
         recordingStart = nil
         isSaving = true
+        let pipeline = insightsPipeline
+        insightsPipeline = nil
         Task.detached(priority: .userInitiated) {
             do {
                 let result = try activeSession.stopAndFinalize()
@@ -291,7 +350,44 @@ public final class AppState: ObservableObject {
                     self?.errorMessage = "Finalize failed: \(error.localizedDescription). PCM masters are preserved in the backup folder."
                 }
             }
+            // Wind down insights after the audio is safe: drains remaining
+            // analysis audio, runs a final deep pass, flushes transcript and
+            // insights JSON into the session directory.
+            if let pipeline {
+                await pipeline.finish()
+                await MainActor.run { [weak self] in
+                    self?.insightsSessionActive = false
+                }
+            }
         }
+    }
+
+    // MARK: - Insights
+
+    /// Pause/resume streaming audio to AWS mid-recording (off the record).
+    public func toggleInsightsPaused() {
+        guard let pipeline = insightsPipeline else { return }
+        insightsPaused.toggle()
+        pipeline.setPaused(insightsPaused)
+    }
+
+    /// Called by the setup sheet when configuration is saved: persists it and
+    /// flips the master switch on.
+    public func applyInsightsConfiguration(_ configuration: InsightsConfiguration) {
+        insightsConfiguration = configuration
+        configuration.save()
+        showInsightsSetup = false
+        if !insightsEnabled {
+            insightsEnabled = true
+        }
+    }
+
+    /// Forgets configuration and stored keys, and disables insights.
+    public func resetInsightsConfiguration() {
+        insightsEnabled = false
+        insightsConfiguration = nil
+        InsightsConfiguration.clear()
+        InsightsKeychain().delete()
     }
 
     // MARK: - Recovery

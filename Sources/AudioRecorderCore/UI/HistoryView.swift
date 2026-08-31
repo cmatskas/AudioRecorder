@@ -1,0 +1,254 @@
+import AVFoundation
+import SwiftUI
+
+/// Read-only browser over past recordings in the backup folder: play them,
+/// read their transcripts and insights, reveal them in Finder. Never writes.
+public struct HistoryView: View {
+    @EnvironmentObject private var state: AppState
+    @StateObject private var model = HistoryViewModel()
+
+    public init() {}
+
+    public var body: some View {
+        VStack(spacing: 10) {
+            if model.items.isEmpty {
+                emptyState
+            } else {
+                list
+                if let selected = model.selected {
+                    detail(for: selected)
+                }
+            }
+        }
+        .onAppear { model.refresh(root: state.backupRoot) }
+        .onDisappear { model.stopPlayback() }
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: 6) {
+            Image(systemName: "clock.arrow.circlepath")
+                .font(.largeTitle)
+                .foregroundStyle(.tertiary)
+            Text("No finished recordings yet")
+                .foregroundStyle(.secondary)
+            Text("Recordings appear here after they complete.")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+        }
+        .frame(maxWidth: .infinity, minHeight: 200)
+    }
+
+    private var list: some View {
+        ScrollView {
+            LazyVStack(spacing: 2) {
+                ForEach(model.items) { item in
+                    row(item)
+                }
+            }
+        }
+        .frame(minHeight: 180, maxHeight: 260)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color(nsColor: .controlBackgroundColor))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(Color.primary.opacity(0.08))
+        )
+    }
+
+    private func row(_ item: HistoryItem) -> some View {
+        Button {
+            model.select(item)
+        } label: {
+            HStack(spacing: 8) {
+                Text(item.createdAt.formatted(date: .abbreviated, time: .shortened))
+                    .font(.callout.monospacedDigit())
+                    .frame(width: 150, alignment: .leading)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(item.name)
+                        .font(.callout)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    if let mic = item.micName {
+                        Text(mic).font(.caption2).foregroundStyle(.tertiary)
+                    }
+                }
+                Spacer()
+                if item.hasInsights || item.hasTranscript {
+                    Image(systemName: "sparkles")
+                        .font(.caption)
+                        .foregroundStyle(.purple)
+                        .help("Has transcript and insights")
+                }
+                if item.audioURL == nil {
+                    Image(systemName: "waveform.slash")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .help("No merged audio file (PCM masters only)")
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(model.selected?.id == item.id ? Color.accentColor.opacity(0.15) : .clear)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func detail(for item: HistoryItem) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                if item.audioURL != nil {
+                    Button {
+                        model.togglePlayback()
+                    } label: {
+                        Label(
+                            model.isPlaying ? "Stop" : "Play",
+                            systemImage: model.isPlaying ? "stop.fill" : "play.fill"
+                        )
+                    }
+                    .controlSize(.small)
+                }
+                Button("Show in Finder") {
+                    state.revealInFinder(item.audioURL ?? item.directory)
+                }
+                .controlSize(.small)
+                Spacer()
+            }
+
+            if model.transcript != nil || model.insights != nil {
+                detailTabs
+            } else {
+                Text("No transcript for this recording — Live Insights was off.")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color(nsColor: .controlBackgroundColor))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(Color.primary.opacity(0.08))
+        )
+    }
+
+    @ViewBuilder
+    private var detailTabs: some View {
+        Picker("", selection: $model.detailTab) {
+            if model.insights != nil {
+                Text("Summary").tag(HistoryViewModel.DetailTab.summary)
+            }
+            if model.transcript != nil {
+                Text("Transcript").tag(HistoryViewModel.DetailTab.transcript)
+            }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+
+        ScrollView {
+            switch model.detailTab {
+            case .summary:
+                if let insights = model.insights {
+                    VStack(alignment: .leading, spacing: 8) {
+                        if !insights.summary.isEmpty {
+                            Text(insights.summary)
+                                .font(.callout)
+                                .textSelection(.enabled)
+                        }
+                        if !insights.suggestions.isEmpty {
+                            Text("Last suggested follow-ups")
+                                .font(.caption.bold())
+                                .foregroundStyle(.secondary)
+                            ForEach(insights.suggestions) { suggestion in
+                                Text("• \(suggestion.text)")
+                                    .font(.callout)
+                                    .textSelection(.enabled)
+                            }
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            case .transcript:
+                if let transcript = model.transcript {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(transcript.utterances) { utterance in
+                            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                Text(utterance.speaker.displayName)
+                                    .font(.caption.bold())
+                                    .foregroundStyle(
+                                        utterance.speaker == .me ? Color.blue : Color.purple
+                                    )
+                                    .frame(width: 42, alignment: .trailing)
+                                Text(utterance.text)
+                                    .font(.callout)
+                                    .textSelection(.enabled)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .frame(minHeight: 100, maxHeight: 220)
+    }
+}
+
+/// State for the History tab. All operations are reads; playback uses its own
+/// player and never touches the capture engine.
+@MainActor
+final class HistoryViewModel: ObservableObject {
+    enum DetailTab: Hashable {
+        case summary
+        case transcript
+    }
+
+    @Published var items: [HistoryItem] = []
+    @Published var selected: HistoryItem?
+    @Published var transcript: InsightsPersistence.TranscriptFile?
+    @Published var insights: InsightsPersistence.InsightsFile?
+    @Published var isPlaying = false
+    @Published var detailTab: DetailTab = .summary
+
+    private var player: AVAudioPlayer?
+
+    func refresh(root: URL) {
+        let scanned = HistoryScanner.scan(root: root)
+        items = scanned
+        if let selected, !scanned.contains(selected) {
+            self.selected = nil
+        }
+    }
+
+    func select(_ item: HistoryItem) {
+        stopPlayback()
+        selected = item
+        transcript = InsightsPersistence.readTranscript(in: item.directory)
+        insights = InsightsPersistence.readInsights(in: item.directory)
+        detailTab = insights != nil ? .summary : .transcript
+    }
+
+    func togglePlayback() {
+        if isPlaying {
+            stopPlayback()
+            return
+        }
+        guard let url = selected?.audioURL else { return }
+        player = try? AVAudioPlayer(contentsOf: url)
+        player?.play()
+        isPlaying = player?.isPlaying ?? false
+    }
+
+    func stopPlayback() {
+        player?.stop()
+        player = nil
+        isPlaying = false
+    }
+}
