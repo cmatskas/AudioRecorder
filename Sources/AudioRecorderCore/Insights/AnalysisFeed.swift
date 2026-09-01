@@ -145,11 +145,19 @@ public final class AnalysisFeed: @unchecked Sendable {
             if status == .error || error != nil { return }
 
             let frames = Int(outputBuffer.frameLength)
-            if frames > 0, !paused.load(ordering: .acquiring),
-               let int16Data = outputBuffer.int16ChannelData {
-                let data = Data(
-                    bytes: int16Data[0], count: frames * MemoryLayout<Int16>.size
-                )
+            if frames > 0, let int16Data = outputBuffer.int16ChannelData {
+                // While paused, the same number of frames is emitted but
+                // zeroed: Transcribe closes streams after ~15 s without
+                // audio, so silence keeps the connection alive while
+                // guaranteeing no conversation content leaves the machine.
+                let data: Data
+                if paused.load(ordering: .acquiring) {
+                    data = Data(count: frames * MemoryLayout<Int16>.size)
+                } else {
+                    data = Data(
+                        bytes: int16Data[0], count: frames * MemoryLayout<Int16>.size
+                    )
+                }
                 continuation.yield(data)
             }
             // Once the single pending buffer is consumed the converter will

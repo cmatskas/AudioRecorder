@@ -154,6 +154,14 @@ public final class InsightEngine {
         fastDebouncer?.trigger()
     }
 
+    /// Stops timers and pending work without running a final pass. Used when
+    /// tearing down without needing a closing summary.
+    public func cancelPendingWork() {
+        fastDebouncer?.cancel()
+        deepTask?.cancel()
+        deepTask = nil
+    }
+
     /// Final flush: one last deep pass over the whole conversation, then stop.
     public func finish() async {
         fastDebouncer?.cancel()

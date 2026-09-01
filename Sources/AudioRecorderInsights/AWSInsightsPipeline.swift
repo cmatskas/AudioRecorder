@@ -56,31 +56,20 @@ public final class AWSInsightsPipeline: InsightsPipeline, @unchecked Sendable {
             feed.start()
         }
 
-        let setupTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            do {
-                let llm = try await BedrockLLMClient(configuration: configuration)
-                let engine = InsightEngine(
-                    transcript: transcript,
-                    model: model,
-                    llm: llm,
-                    fastModelID: configuration.fastModelID,
-                    deepModelID: configuration.deepModelID,
-                    sessionDirectory: sessionDirectory
-                )
-                engine.start()
-                self.engine = engine
-                self.startStreamers(engine: engine)
-                if model.status == .starting {
-                    model.status = .live
-                }
-            } catch {
-                model.status = .degraded(
-                    "Could not start analysis (\(error.localizedDescription)). Recording is unaffected."
-                )
-            }
-        }
-        streamTasks.append(Task { await setupTask.value })
+        // The Bedrock client is constructed lazily on first use, so the
+        // engine exists before the first utterance and "Live" is gated only
+        // on transcription actually connecting.
+        let engine = InsightEngine(
+            transcript: transcript,
+            model: model,
+            llm: LazyBedrockClient(configuration: configuration),
+            fastModelID: configuration.fastModelID,
+            deepModelID: configuration.deepModelID,
+            sessionDirectory: sessionDirectory
+        )
+        engine.start()
+        self.engine = engine
+        startStreamers(engine: engine)
     }
 
     @MainActor
@@ -91,11 +80,21 @@ public final class AWSInsightsPipeline: InsightsPipeline, @unchecked Sendable {
             )
             let task = Task { [weak self, model] in
                 do {
-                    try await streamer.run(chunks: feed.chunks) { utterance in
-                        Task { @MainActor [weak self] in
-                            self?.engine?.noteUtterance(utterance)
+                    try await streamer.run(
+                        chunks: feed.chunks,
+                        onConnected: {
+                            Task { @MainActor in
+                                if model.status == .starting {
+                                    model.status = .live
+                                }
+                            }
+                        },
+                        onUtterance: { utterance in
+                            Task { @MainActor [weak self] in
+                                self?.engine?.noteUtterance(utterance)
+                            }
                         }
-                    }
+                    )
                 } catch is CancellationError {
                     // Shutting down.
                 } catch {

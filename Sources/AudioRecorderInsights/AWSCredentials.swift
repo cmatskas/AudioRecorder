@@ -50,6 +50,41 @@ enum AWSCredentials {
             )
         }
     }
+
+    /// Raw credentials for request presigning (the Transcribe WebSocket URL
+    /// is signed by us, not by the SDK). Same resolution order as
+    /// `resolver(for:)`; profiles without inline keys go through the SDK's
+    /// chain and are unwrapped to their raw form.
+    static func rawCredentials(
+        for configuration: InsightsConfiguration
+    ) async throws -> RawAWSCredentials {
+        switch configuration.credentialSource {
+        case let .profile(name):
+            if let keys = AWSProfileDiscovery.staticCredentials(forProfile: name) {
+                return RawAWSCredentials(
+                    accessKeyID: keys.accessKeyID,
+                    secretAccessKey: keys.secretAccessKey,
+                    sessionToken: keys.sessionToken
+                )
+            }
+            let identity = try await ProfileAWSCredentialIdentityResolver(profileName: name)
+                .getIdentity(identityProperties: nil)
+            return RawAWSCredentials(
+                accessKeyID: identity.accessKey,
+                secretAccessKey: identity.secret,
+                sessionToken: identity.sessionToken
+            )
+        case .keychain:
+            guard let keys = InsightsKeychain().load() else {
+                throw CredentialError.missingKeychainKeys
+            }
+            return RawAWSCredentials(
+                accessKeyID: keys.accessKeyID,
+                secretAccessKey: keys.secretAccessKey,
+                sessionToken: nil
+            )
+        }
+    }
 }
 
 /// "Test connection" for the setup sheet: a call to STS GetCallerIdentity,

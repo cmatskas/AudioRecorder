@@ -6,8 +6,16 @@ import SwiftUI
 /// this window can worry the user about insights, never about audio.
 public struct InsightsPanelView: View {
     @EnvironmentObject private var state: AppState
+    /// Passed in and observed directly rather than reached through
+    /// `AppState`: AppState holds `insightsModel` as a plain property, so
+    /// mutations to it do not notify AppState's observers and the panel would
+    /// never refresh during a recording (insights would appear only on stop).
+    /// Taking it as an explicit dependency makes that mistake a compile error.
+    @ObservedObject private var insights: InsightsModel
 
-    public init() {}
+    public init(insights: InsightsModel) {
+        self.insights = insights
+    }
 
     public var body: some View {
         VStack(spacing: 0) {
@@ -51,7 +59,7 @@ public struct InsightsPanelView: View {
 
     @ViewBuilder
     private var statusBadge: some View {
-        switch state.insightsModel.status {
+        switch insights.status {
         case .idle, .stopped:
             Text("Ended").font(.caption).foregroundStyle(.secondary)
         case .starting:
@@ -76,7 +84,7 @@ public struct InsightsPanelView: View {
 
     @ViewBuilder
     private var statusStrip: some View {
-        if case let .degraded(message) = state.insightsModel.status {
+        if case let .degraded(message) = insights.status {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
                 Image(systemName: "exclamationmark.triangle.fill")
                 Text(message)
@@ -88,7 +96,7 @@ public struct InsightsPanelView: View {
             .padding(8)
             .background(Color.yellow.opacity(0.15))
         } else if state.insightsPaused {
-            Text("Paused — no audio is being sent to AWS. Recording continues.")
+            Text("Paused — your audio is replaced with silence; nothing said is sent to AWS. Recording continues.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -103,22 +111,22 @@ public struct InsightsPanelView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 6) {
-                    if state.insightsModel.utterances.isEmpty {
+                    if insights.utterances.isEmpty {
                         Text("Waiting for speech…")
                             .font(.callout)
                             .foregroundStyle(.tertiary)
                             .padding(.top, 20)
                             .frame(maxWidth: .infinity)
                     }
-                    ForEach(state.insightsModel.utterances) { utterance in
+                    ForEach(insights.utterances) { utterance in
                         utteranceRow(utterance)
                             .id(utterance.id)
                     }
                 }
                 .padding(12)
             }
-            .onChange(of: state.insightsModel.utterances.count) {
-                if let last = state.insightsModel.utterances.last {
+            .onChange(of: insights.utterances.count) {
+                if let last = insights.utterances.last {
                     withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
                 }
             }
@@ -146,12 +154,12 @@ public struct InsightsPanelView: View {
             Label("Suggested follow-ups", systemImage: "lightbulb.fill")
                 .font(.caption.bold())
                 .foregroundStyle(.secondary)
-            if state.insightsModel.suggestions.isEmpty {
+            if insights.suggestions.isEmpty {
                 Text("Suggestions appear as the conversation develops.")
                     .font(.callout)
                     .foregroundStyle(.tertiary)
             } else {
-                ForEach(state.insightsModel.suggestions) { suggestion in
+                ForEach(insights.suggestions) { suggestion in
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
                         Text("•").foregroundStyle(.purple)
                         Text(suggestion.text)
@@ -163,7 +171,7 @@ public struct InsightsPanelView: View {
                 }
             }
         }
-        .animation(.easeInOut(duration: 0.3), value: state.insightsModel.suggestions)
+        .animation(.easeInOut(duration: 0.3), value: insights.suggestions)
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(12)
         .background(Color.purple.opacity(0.06))
@@ -173,21 +181,21 @@ public struct InsightsPanelView: View {
 
     @ViewBuilder
     private var summarySection: some View {
-        if !state.insightsModel.summary.isEmpty {
+        if !insights.summary.isEmpty {
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
                     Label("Summary", systemImage: "doc.text")
                         .font(.caption.bold())
                         .foregroundStyle(.secondary)
                     Spacer()
-                    if let updated = state.insightsModel.summaryUpdatedAt {
+                    if let updated = insights.summaryUpdatedAt {
                         Text("updated \(updated.formatted(date: .omitted, time: .shortened))")
                             .font(.caption2)
                             .foregroundStyle(.tertiary)
                     }
                 }
                 ScrollView {
-                    Text(state.insightsModel.summary)
+                    Text(insights.summary)
                         .font(.callout)
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)

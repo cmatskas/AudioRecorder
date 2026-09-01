@@ -1,3 +1,4 @@
+import Combine
 import Synchronization
 import XCTest
 @testable import AudioRecorderCore
@@ -238,6 +239,66 @@ final class InsightsTests: XCTestCase {
         let readInsights = InsightsPersistence.readInsights(in: directory)
         XCTAssertEqual(readInsights?.summary, "s")
         XCTAssertEqual(readInsights?.suggestions.map(\.text), ["q?"])
+    }
+
+    // MARK: - Live UI observation
+
+    /// The bug this pins: insights appeared only after stopping a recording,
+    /// because the panel observed `AppState` while the data lives on a
+    /// separate `InsightsModel`. Mutations must publish on the model itself,
+    /// and any view showing them must subscribe to the model directly.
+    @MainActor
+    func testModelPublishesEachUtteranceWhileRecording() async throws {
+        let model = InsightsModel()
+        var notifications = 0
+        let cancellable = model.objectWillChange.sink { _ in notifications += 1 }
+        defer { cancellable.cancel() }
+
+        let engine = InsightEngine(
+            transcript: TranscriptStore(),
+            model: model,
+            llm: MockLLM { _, _, _ in "[]" },
+            fastModelID: "f",
+            deepModelID: "d",
+            // Long timers: this asserts publishing, not analysis.
+            tuning: .init(fastDebounce: .seconds(600), deepInterval: .seconds(600)),
+            sessionDirectory: nil
+        )
+        engine.start()
+
+        engine.noteUtterance(Utterance(speaker: .them, text: "first", timestamp: Date()))
+        XCTAssertGreaterThan(notifications, 0, "no publish after the first utterance")
+        let afterFirst = notifications
+
+        engine.noteUtterance(Utterance(speaker: .me, text: "second", timestamp: Date()))
+        XCTAssertGreaterThan(
+            notifications, afterFirst,
+            "second utterance did not publish — the panel would not refresh live"
+        )
+        XCTAssertEqual(model.utterances.map(\.text), ["first", "second"])
+        engine.cancelPendingWork()
+    }
+
+    /// Documents the trap: `AppState` does not relay `InsightsModel` changes,
+    /// so observing only `AppState` cannot show live insights.
+    @MainActor
+    func testAppStateDoesNotRelayInsightsModelChanges() {
+        let model = InsightsModel()
+        var relayed = 0
+        // Stand-in for the AppState relationship: a plain (non-@Published)
+        // reference to the model.
+        final class Holder: ObservableObject { let insights: InsightsModel
+            init(_ insights: InsightsModel) { self.insights = insights }
+        }
+        let holder = Holder(model)
+        let cancellable = holder.objectWillChange.sink { _ in relayed += 1 }
+        defer { cancellable.cancel() }
+
+        model.utterances = [Utterance(speaker: .me, text: "hello", timestamp: Date())]
+        XCTAssertEqual(
+            relayed, 0,
+            "if this ever relays, the panel could rely on the container instead"
+        )
     }
 
     // MARK: - AWS profile parsing

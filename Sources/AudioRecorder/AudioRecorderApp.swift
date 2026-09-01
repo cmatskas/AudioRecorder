@@ -32,7 +32,9 @@ struct AudioRecorderApp: App {
         }
 
         Window("Live Insights", id: "insights") {
-            InsightsPanelView()
+            // The model is passed explicitly: the panel observes it directly
+            // so the transcript refreshes live during a recording.
+            InsightsPanelView(insights: state.insightsModel)
                 .environmentObject(state)
         }
         .defaultSize(width: 420, height: 640)
