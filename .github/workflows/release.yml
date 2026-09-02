@@ -8,14 +8,81 @@ on:
       tag:
         description: "Tag to release (e.g. v1.0.1)"
         required: true
+      skip_ci_check:
+        description: "Publish even if CI did not pass for the commit (emergencies only)"
+        type: boolean
+        default: false
 
 # Narrower than granting Actions write access repo-wide.
+# actions:read lets the gate below query the CI run for this commit.
 permissions:
   contents: write
+  actions: read
 
 jobs:
+  verify:
+    name: Require CI to have passed
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Tags and their history are needed to resolve a tag to a commit.
+          fetch-depth: 0
+
+      - name: Resolve the commit being released
+        id: resolve
+        env:
+          RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-list -n 1 "$RAW_TAG")"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Releasing $RAW_TAG ($SHA)"
+
+      - name: Require the CI workflow to have succeeded for this commit
+        if: ${{ github.event.inputs.skip_ci_check != 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # Release runs its own tests too, but that is a separate roll of the
+          # dice: a flaky test can pass here while CI rejects the same commit,
+          # which is how a release once published code CI had failed. Require
+          # CI's verdict for this exact commit, and fail closed if there is
+          # none.
+          DEADLINE=$(( SECONDS + 45 * 60 ))
+          while :; do
+            RUNS="$(gh run list --workflow ci.yml --commit "$SHA" --limit 1 \
+                      --json status,conclusion,url)"
+            if [ "$(jq 'length' <<< "$RUNS")" -eq 0 ]; then
+              echo "No CI run found yet for $SHA …"
+            else
+              STATUS="$(jq -r '.[0].status' <<< "$RUNS")"
+              CONCLUSION="$(jq -r '.[0].conclusion' <<< "$RUNS")"
+              URL="$(jq -r '.[0].url' <<< "$RUNS")"
+              echo "CI status=$STATUS conclusion=$CONCLUSION ($URL)"
+              if [ "$STATUS" = "completed" ]; then
+                if [ "$CONCLUSION" = "success" ]; then
+                  echo "CI passed for $SHA; continuing."
+                  exit 0
+                fi
+                echo "::error::CI concluded '$CONCLUSION' for $SHA — refusing to publish. See $URL"
+                exit 1
+              fi
+            fi
+            if [ "$SECONDS" -ge "$DEADLINE" ]; then
+              echo "::error::Timed out waiting for CI to finish for $SHA. No release published."
+              exit 1
+            fi
+            sleep 30
+          done
+
   release:
     name: Build, notarize and publish
+    needs: verify
     runs-on: macos-15
     env:
       APP_NAME: AudioRecorder
