@@ -6,6 +6,7 @@ import SwiftUI
 public struct HistoryView: View {
     @EnvironmentObject private var state: AppState
     @StateObject private var model = HistoryViewModel()
+    @State private var showExport = false
 
     public init() {}
 
@@ -22,6 +23,19 @@ public struct HistoryView: View {
         }
         .onAppear { model.refresh(root: state.backupRoot) }
         .onDisappear { model.stopPlayback() }
+        .sheet(isPresented: $showExport) {
+            if let selected = model.selected {
+                TranscriptExportSheet(
+                    content: TranscriptExporter.Content(
+                        title: selected.name,
+                        recordedAt: selected.createdAt,
+                        utterances: model.utterances,
+                        summary: model.insights?.summary ?? "",
+                        suggestions: model.insights?.suggestions ?? []
+                    )
+                )
+            }
+        }
     }
 
     private var emptyState: some View {
@@ -117,10 +131,18 @@ public struct HistoryView: View {
                     state.revealInFinder(item.audioURL ?? item.directory)
                 }
                 .controlSize(.small)
+                if !model.utterances.isEmpty {
+                    Button {
+                        showExport = true
+                    } label: {
+                        Label("Export transcript…", systemImage: "square.and.arrow.up")
+                    }
+                    .controlSize(.small)
+                }
                 Spacer()
             }
 
-            if model.transcript != nil || model.insights != nil {
+            if !model.utterances.isEmpty || model.insights != nil {
                 detailTabs
             } else {
                 Text("No transcript for this recording — Live Insights was off.")
@@ -146,7 +168,7 @@ public struct HistoryView: View {
             if model.insights != nil {
                 Text("Summary").tag(HistoryViewModel.DetailTab.summary)
             }
-            if model.transcript != nil {
+            if !model.utterances.isEmpty {
                 Text("Transcript").tag(HistoryViewModel.DetailTab.transcript)
             }
         }
@@ -177,9 +199,9 @@ public struct HistoryView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
             case .transcript:
-                if let transcript = model.transcript {
+                if !model.utterances.isEmpty {
                     VStack(alignment: .leading, spacing: 4) {
-                        ForEach(transcript.utterances) { utterance in
+                        ForEach(model.utterances) { utterance in
                             HStack(alignment: .firstTextBaseline, spacing: 8) {
                                 Text(utterance.speaker.displayName)
                                     .font(.caption.bold())
@@ -212,7 +234,7 @@ final class HistoryViewModel: ObservableObject {
 
     @Published var items: [HistoryItem] = []
     @Published var selected: HistoryItem?
-    @Published var transcript: InsightsPersistence.TranscriptFile?
+    @Published var utterances: [Utterance] = []
     @Published var insights: InsightsPersistence.InsightsFile?
     @Published var isPlaying = false
     @Published var detailTab: DetailTab = .summary
@@ -230,7 +252,8 @@ final class HistoryViewModel: ObservableObject {
     func select(_ item: HistoryItem) {
         stopPlayback()
         selected = item
-        transcript = InsightsPersistence.readTranscript(in: item.directory)
+        // Prefers the append-only log, so a crashed session still reads fully.
+        utterances = InsightsPersistence.readUtterances(in: item.directory)
         insights = InsightsPersistence.readInsights(in: item.directory)
         detailTab = insights != nil ? .summary : .transcript
     }

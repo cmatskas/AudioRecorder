@@ -56,6 +56,16 @@ public enum InsightsPersistence {
         try data.write(to: url, options: .atomic)
     }
 
+    /// Utterances for a session, preferring the append-only log over the
+    /// snapshot: after a crash the log is complete up to the last flush while
+    /// the snapshot may never have been written.
+    public static func readUtterances(in directory: URL) -> [Utterance] {
+        if let logged = TranscriptLog.readUtterances(in: directory), !logged.isEmpty {
+            return logged
+        }
+        return readTranscript(in: directory)?.utterances ?? []
+    }
+
     public static func readTranscript(in directory: URL) -> TranscriptFile? {
         read(directory.appendingPathComponent(transcriptFileName))
     }

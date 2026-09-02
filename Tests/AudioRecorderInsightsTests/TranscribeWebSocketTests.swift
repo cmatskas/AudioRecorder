@@ -108,6 +108,31 @@ final class TranscribeWebSocketTests: XCTestCase {
         XCTAssertEqual(TranscribeStreamer.finalTranscripts(in: payload), ["final text"])
     }
 
+    func testFinalResultsCaptureAudioRelativeOffsets() {
+        let payload = Data("""
+        {"Transcript":{"Results":[
+            {"IsPartial":false,"StartTime":65.5,"EndTime":68.25,
+             "Alternatives":[{"Transcript":"final text"}]}
+        ]}}
+        """.utf8)
+        let results = TranscribeStreamer.finalResults(in: payload)
+        XCTAssertEqual(results.count, 1)
+        XCTAssertEqual(results.first?.text, "final text")
+        XCTAssertEqual(results.first?.start, 65.5)
+        XCTAssertEqual(results.first?.end, 68.25)
+    }
+
+    func testFinalResultsToleratePayloadsWithoutTimings() {
+        let payload = Data("""
+        {"Transcript":{"Results":[
+            {"IsPartial":false,"Alternatives":[{"Transcript":"no timings"}]}
+        ]}}
+        """.utf8)
+        let results = TranscribeStreamer.finalResults(in: payload)
+        XCTAssertEqual(results.first?.text, "no timings")
+        XCTAssertNil(results.first?.start)
+    }
+
     func testFinalTranscriptsHandlesEmptyAndGarbagePayloads() {
         XCTAssertEqual(TranscribeStreamer.finalTranscripts(in: Data("{}".utf8)), [])
         XCTAssertEqual(TranscribeStreamer.finalTranscripts(in: Data("garbage".utf8)), [])

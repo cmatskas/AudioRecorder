@@ -13,6 +13,8 @@ public struct InsightsPanelView: View {
     /// Taking it as an explicit dependency makes that mistake a compile error.
     @ObservedObject private var insights: InsightsModel
 
+    @State private var showExport = false
+
     public init(insights: InsightsModel) {
         self.insights = insights
     }
@@ -29,6 +31,17 @@ public struct InsightsPanelView: View {
         }
         .frame(minWidth: 360, idealWidth: 420, minHeight: 480, idealHeight: 640)
         .background(.background)
+        .sheet(isPresented: $showExport) {
+            TranscriptExportSheet(
+                content: TranscriptExporter.Content(
+                    title: "Live transcript",
+                    recordedAt: insights.utterances.first?.timestamp,
+                    utterances: insights.utterances,
+                    summary: insights.summary,
+                    suggestions: insights.suggestions
+                )
+            )
+        }
     }
 
     // MARK: - Header
@@ -41,6 +54,14 @@ public struct InsightsPanelView: View {
                 .font(.headline)
             Spacer()
             statusBadge
+            if !insights.utterances.isEmpty {
+                Button {
+                    showExport = true
+                } label: {
+                    Image(systemName: "square.and.arrow.up")
+                }
+                .help("Export this transcript")
+            }
             if state.insightsSessionActive {
                 Button {
                     state.toggleInsightsPaused()

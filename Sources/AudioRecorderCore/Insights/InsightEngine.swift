@@ -108,7 +108,7 @@ public final class InsightEngine {
     private let fastModelID: String
     private let deepModelID: String
     private let tuning: Tuning
-    private let sessionDirectory: URL?
+    private let recorder: TranscriptRecorder?
 
     private var fastDebouncer: AsyncDebouncer?
     private var deepTask: Task<Void, Never>?
@@ -122,7 +122,7 @@ public final class InsightEngine {
         fastModelID: String,
         deepModelID: String,
         tuning: Tuning = Tuning(),
-        sessionDirectory: URL?
+        recorder: TranscriptRecorder? = nil
     ) {
         self.transcript = transcript
         self.model = model
@@ -130,7 +130,7 @@ public final class InsightEngine {
         self.fastModelID = fastModelID
         self.deepModelID = deepModelID
         self.tuning = tuning
-        self.sessionDirectory = sessionDirectory
+        self.recorder = recorder
     }
 
     public func start() {
@@ -150,7 +150,9 @@ public final class InsightEngine {
     public func noteUtterance(_ utterance: Utterance) {
         transcript.append(utterance)
         model.utterances = transcript.all
-        persistTranscript()
+        // Appended immediately, before any analysis: the transcript must be on
+        // disk even if the fast/deep lanes never run.
+        recorder?.append(utterance)
         fastDebouncer?.trigger()
     }
 
@@ -170,8 +172,12 @@ public final class InsightEngine {
         if !transcript.isEmpty {
             await runDeepPass(force: true)
         }
-        persistTranscript()
-        persistInsights()
+        recorder?.finish(
+            utterances: transcript.all,
+            summary: model.summary,
+            suggestions: model.suggestions,
+            updatedAt: model.summaryUpdatedAt ?? Date()
+        )
     }
 
     // MARK: - Lanes
@@ -191,7 +197,6 @@ public final class InsightEngine {
             noteSuccess()
             guard !parsed.isEmpty else { return }
             model.suggestions = parsed.map { Suggestion(text: $0) }
-            persistInsights()
         } catch {
             noteFailure(error, lane: "suggestions")
         }
@@ -216,7 +221,6 @@ public final class InsightEngine {
             guard !summary.isEmpty else { return }
             model.summary = summary
             model.summaryUpdatedAt = Date()
-            persistInsights()
         } catch {
             noteFailure(error, lane: "summary")
         }
@@ -243,27 +247,4 @@ public final class InsightEngine {
         }
     }
 
-    // MARK: - Persistence
-
-    private func persistTranscript() {
-        guard let directory = sessionDirectory else { return }
-        let file = InsightsPersistence.TranscriptFile(utterances: transcript.all)
-        let url = directory.appendingPathComponent(InsightsPersistence.transcriptFileName)
-        Task.detached(priority: .utility) {
-            try? InsightsPersistence.write(file, to: url)
-        }
-    }
-
-    private func persistInsights() {
-        guard let directory = sessionDirectory else { return }
-        let file = InsightsPersistence.InsightsFile(
-            summary: model.summary,
-            suggestions: model.suggestions,
-            updatedAt: model.summaryUpdatedAt ?? Date()
-        )
-        let url = directory.appendingPathComponent(InsightsPersistence.insightsFileName)
-        Task.detached(priority: .utility) {
-            try? InsightsPersistence.write(file, to: url)
-        }
-    }
 }

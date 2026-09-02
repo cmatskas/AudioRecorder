@@ -311,7 +311,13 @@ public final class AppState: ObservableObject {
                 recordingStart = Date()
 
                 if let pipeline {
-                    pipeline.start(sessionDirectory: newSession.backupSessionDirectory)
+                    pipeline.start(
+                        destinations: TranscriptDestinations(
+                            sessionName: newSession.sessionName,
+                            liveDirectory: newSession.backupSessionDirectory,
+                            exportRoots: [userDestination].compactMap { $0 }
+                        )
+                    )
                     insightsPipeline = pipeline
                     insightsPaused = false
                     insightsSessionActive = true

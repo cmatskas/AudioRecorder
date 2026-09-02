@@ -120,7 +120,11 @@ final class LiveAWSIntegrationTests: XCTestCase {
         let pipeline = AWSInsightsPipeline(configuration: configuration, model: model)
         let sinks = pipeline.makeExtraSinks(micRate: 16_000, systemRate: nil)
         let ring = try XCTUnwrap(sinks.mic.first)
-        pipeline.start(sessionDirectory: nil)
+        pipeline.start(
+            destinations: TranscriptDestinations(
+                sessionName: "live-test", liveDirectory: nil
+            )
+        )
 
         // Push 100 ms of stereo float frames at a time, paced in real time.
         let framesPerChunk = 1_600

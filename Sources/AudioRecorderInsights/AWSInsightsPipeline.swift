@@ -44,7 +44,7 @@ public final class AWSInsightsPipeline: InsightsPipeline, @unchecked Sendable {
     }
 
     @MainActor
-    public func start(sessionDirectory: URL?) {
+    public func start(destinations: TranscriptDestinations) {
         guard !feeds.isEmpty else {
             model.status = .degraded("No audio sources available for analysis.")
             return
@@ -65,7 +65,11 @@ public final class AWSInsightsPipeline: InsightsPipeline, @unchecked Sendable {
             llm: LazyBedrockClient(configuration: configuration),
             fastModelID: configuration.fastModelID,
             deepModelID: configuration.deepModelID,
-            sessionDirectory: sessionDirectory
+            recorder: TranscriptRecorder(
+                sessionName: destinations.sessionName,
+                liveDirectory: destinations.liveDirectory,
+                exportRoots: destinations.exportRoots
+            )
         )
         engine.start()
         self.engine = engine

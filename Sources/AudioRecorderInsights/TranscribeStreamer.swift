@@ -93,8 +93,16 @@ struct TranscribeStreamer {
 
             switch frame.headers[":message-type"] {
             case "event" where frame.headers[":event-type"] == "TranscriptEvent":
-                for text in Self.finalTranscripts(in: frame.payload) {
-                    onUtterance(Utterance(speaker: speaker, text: text, timestamp: Date()))
+                for result in Self.finalResults(in: frame.payload) {
+                    onUtterance(
+                        Utterance(
+                            speaker: speaker,
+                            text: result.text,
+                            timestamp: Date(),
+                            startOffset: result.start,
+                            endOffset: result.end
+                        )
+                    )
                 }
             case "exception":
                 let detail = (try? JSONDecoder().decode(ExceptionPayload.self, from: frame.payload))?.message
@@ -116,9 +124,15 @@ struct TranscribeStreamer {
         struct Result: Decodable {
             let isPartial: Bool
             let alternatives: [Alternative]?
+            /// Seconds from stream start; used for positional timestamps and
+            /// subtitle export.
+            let startTime: Double?
+            let endTime: Double?
             enum CodingKeys: String, CodingKey {
                 case isPartial = "IsPartial"
                 case alternatives = "Alternatives"
+                case startTime = "StartTime"
+                case endTime = "EndTime"
             }
         }
         struct Alternative: Decodable {
@@ -134,14 +148,30 @@ struct TranscribeStreamer {
         enum CodingKeys: String, CodingKey { case message = "Message" }
     }
 
-    static func finalTranscripts(in payload: Data) -> [String] {
+    struct FinalResult: Equatable {
+        var text: String
+        var start: TimeInterval?
+        var end: TimeInterval?
+    }
+
+    static func finalResults(in payload: Data) -> [FinalResult] {
         guard let decoded = try? JSONDecoder().decode(TranscriptPayload.self, from: payload) else {
             return []
         }
         return (decoded.transcript?.results ?? [])
             .filter { !$0.isPartial }
-            .compactMap { $0.alternatives?.first?.transcript }
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
+            .compactMap { result in
+                guard
+                    let text = result.alternatives?.first?.transcript?
+                        .trimmingCharacters(in: .whitespaces),
+                    !text.isEmpty
+                else { return nil }
+                return FinalResult(text: text, start: result.startTime, end: result.endTime)
+            }
+    }
+
+    /// Text of the finalized results, for tests and logging.
+    static func finalTranscripts(in payload: Data) -> [String] {
+        finalResults(in: payload).map(\.text)
     }
 }
