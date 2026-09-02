@@ -49,20 +49,35 @@ final class InsightsTests: XCTestCase {
 
     // MARK: - AsyncDebouncer
 
+    /// Timing note: assertions here only depend on `Task.sleep` lasting *at
+    /// least* as long as requested, which is guaranteed. An earlier version
+    /// spaced the burst with 10 ms sleeps and asserted it had not fired yet —
+    /// that depends on sleeps being *short*, which a loaded CI runner does not
+    /// honour, and it failed there while passing locally.
     @MainActor
     func testDebouncerCoalescesBurstIntoSingleInvocation() async throws {
         var runs = 0
-        let debouncer = AsyncDebouncer(interval: .milliseconds(80)) { runs += 1 }
+        let debouncer = AsyncDebouncer(interval: .milliseconds(50)) { runs += 1 }
+        // Triggered back-to-back with no suspension points in between, so the
+        // debounce window cannot elapse mid-burst however slow the machine is.
         for _ in 0..<5 {
             debouncer.trigger()
-            try await Task.sleep(for: .milliseconds(10))
         }
-        try await Task.sleep(for: .milliseconds(250))
+        try await Task.sleep(for: .milliseconds(400))
+        XCTAssertEqual(runs, 1, "a burst of triggers should coalesce into one invocation")
+    }
+
+    @MainActor
+    func testDebouncerRunsAgainForALaterTrigger() async throws {
+        var runs = 0
+        let debouncer = AsyncDebouncer(interval: .milliseconds(50)) { runs += 1 }
+        debouncer.trigger()
+        try await Task.sleep(for: .milliseconds(400))
         XCTAssertEqual(runs, 1)
 
         debouncer.trigger()
-        try await Task.sleep(for: .milliseconds(250))
-        XCTAssertEqual(runs, 2)
+        try await Task.sleep(for: .milliseconds(400))
+        XCTAssertEqual(runs, 2, "a trigger after the window should invoke again")
     }
 
     @MainActor
@@ -139,7 +154,7 @@ final class InsightsTests: XCTestCase {
             fastModelID: "fast-model",
             deepModelID: "deep-model",
             tuning: .init(fastDebounce: .milliseconds(40), deepInterval: .seconds(600)),
-            sessionDirectory: nil
+            recorder: nil
         )
         engine.start()
         engine.noteUtterance(Utterance(speaker: .them, text: "won't finish by Q3", timestamp: Date()))
@@ -164,7 +179,7 @@ final class InsightsTests: XCTestCase {
             fastModelID: "fast-model",
             deepModelID: "deep-model",
             tuning: .init(fastDebounce: .seconds(600), deepInterval: .seconds(600)),
-            sessionDirectory: nil
+            recorder: nil
         )
         engine.start()
         engine.noteUtterance(Utterance(speaker: .them, text: "Q3 will slip", timestamp: Date()))
@@ -191,7 +206,7 @@ final class InsightsTests: XCTestCase {
             fastModelID: "f",
             deepModelID: "d",
             tuning: .init(fastDebounce: .milliseconds(20), deepInterval: .seconds(600)),
-            sessionDirectory: nil
+            recorder: nil
         )
         engine.start()
         for index in 0..<3 {
@@ -262,7 +277,7 @@ final class InsightsTests: XCTestCase {
             deepModelID: "d",
             // Long timers: this asserts publishing, not analysis.
             tuning: .init(fastDebounce: .seconds(600), deepInterval: .seconds(600)),
-            sessionDirectory: nil
+            recorder: nil
         )
         engine.start()
 
