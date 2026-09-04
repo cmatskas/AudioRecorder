@@ -5,6 +5,9 @@ public struct ContentView: View {
     @Environment(\.openWindow) private var openWindow
     @State private var showRecoveryAlert = false
     @State private var tab: Tab = .record
+    @State private var isEditingName = false
+    @State private var draftName = ""
+    @FocusState private var nameFieldFocused: Bool
 
     private enum Tab: Hashable {
         case record
@@ -22,7 +25,9 @@ public struct ContentView: View {
                 sourcesSection
                 destinationSection
                 insightsSection
+                namingSection
                 recordSection
+                savedNameRow
                 banner
             } else {
                 HistoryView()
@@ -50,6 +55,20 @@ public struct ContentView: View {
             Button("Later", role: .cancel) {}
         } message: {
             Text(recoveryMessage)
+        }
+        .alert("Send audio to Amazon Transcribe?", isPresented: $state.showCloudNamingConsent) {
+            Button("Allow") { state.grantCloudNamingConsent() }
+            Button("Cancel", role: .cancel) { state.declineCloudNamingConsent() }
+        } message: {
+            Text(
+                """
+                To name recordings by what they are about, the first \
+                \(Int(AppState.namingTranscriptionWindow / 60)) minutes of each finished \
+                recording will be uploaded to Amazon Transcribe with your configured AWS \
+                credentials. Nothing is uploaded while you are recording, and you can switch \
+                back to on-device naming at any time.
+                """
+            )
         }
     }
 
@@ -352,6 +371,173 @@ public struct ContentView: View {
         case .keychain:
             return "On · access keys (Keychain) · \(config.region)"
         }
+    }
+
+    // MARK: - Naming row
+
+    /// Content-based naming: one toggle, one backend picker, and a caption that
+    /// states plainly what leaves the machine — the only way a user can judge
+    /// the trade the backends represent.
+    private var namingSection: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "textformat")
+                .foregroundStyle(state.autoNameRecordings ? .teal : .secondary)
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Auto-name recordings")
+                    .font(.callout)
+                Text(namingCaption)
+                    .font(.caption)
+                    .foregroundStyle(
+                        state.namingAvailabilityNote == nil
+                            ? Color.secondary.opacity(0.7)
+                            : Color.orange
+                    )
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer()
+            Picker("", selection: $state.namingBackend) {
+                ForEach(AppState.NamingBackend.allCases, id: \.self) { backend in
+                    Text(backend.label).tag(backend)
+                }
+            }
+            .labelsHidden()
+            .frame(width: 165)
+            .disabled(state.isRecording || !state.autoNameRecordings)
+            Toggle("", isOn: $state.autoNameRecordings)
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .labelsHidden()
+                .disabled(state.isRecording)
+        }
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color(nsColor: .controlBackgroundColor))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(Color.primary.opacity(0.08))
+        )
+    }
+
+    private var namingCaption: String {
+        if let note = state.namingAvailabilityNote {
+            return note
+        }
+        guard state.autoNameRecordings else {
+            return "Recordings keep their date and time as a name"
+        }
+        switch state.namingBackend {
+        case .transcriptOnly:
+            return "Names from the Live Insights transcript · nothing extra is sent"
+        case .onDevice:
+            return "Transcribed on this Mac after recording · no audio leaves"
+        case .amazonTranscribe:
+            let minutes = Int(AppState.namingTranscriptionWindow / 60)
+            return "First \(minutes) min sent to Amazon Transcribe after recording"
+        }
+    }
+
+    // MARK: - Saved recording name
+
+    /// The finished recording's name, editable in place. Renaming has to happen
+    /// here rather than in Finder: the app finds a session's audio by the name in
+    /// its manifest, so a rename behind its back loses the recording from History.
+    @ViewBuilder
+    private var savedNameRow: some View {
+        if let name = state.lastSavedName {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 8) {
+                    Image(systemName: "waveform")
+                        .foregroundStyle(.secondary)
+                        .frame(width: 18)
+                    if isEditingName {
+                        TextField("Recording name", text: $draftName)
+                            .textFieldStyle(.roundedBorder)
+                            .focused($nameFieldFocused)
+                            .onSubmit { commitName() }
+                            .frame(maxWidth: 260)
+                        Button("Save") { commitName() }
+                            .controlSize(.small)
+                            .buttonStyle(.borderedProminent)
+                            .disabled(nameValidationMessage != nil)
+                        Button("Cancel") { isEditingName = false }
+                            .controlSize(.small)
+                    } else {
+                        Button {
+                            draftName = name
+                            isEditingName = true
+                            nameFieldFocused = true
+                        } label: {
+                            HStack(spacing: 5) {
+                                Text(name)
+                                    .font(.callout.weight(.medium))
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                Image(systemName: "pencil")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(state.isRecording || state.isSaving || state.isRenaming)
+                        .help("Click to rename this recording")
+                        .accessibilityLabel("Recording name, \(name)")
+                        .accessibilityHint("Activate to rename")
+                        if state.isNaming {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Naming…")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        if state.isRenaming {
+                            ProgressView().controlSize(.small)
+                        }
+                        Spacer()
+                        if state.lastSavedURL != nil {
+                            Button("Show in Finder") { state.revealLastSaved() }
+                                .controlSize(.small)
+                        }
+                    }
+                }
+                if isEditingName, let message = nameValidationMessage {
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .padding(.leading, 26)
+                }
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(Color(nsColor: .controlBackgroundColor))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .strokeBorder(Color.primary.opacity(0.08))
+            )
+            .onExitCommand { isEditingName = false }
+            .transition(.opacity)
+        }
+    }
+
+    private var nameValidationMessage: String? {
+        switch SessionRenamer.validate(draftName) {
+        case .success:
+            return nil
+        case let .failure(error):
+            return error.errorDescription
+        }
+    }
+
+    private func commitName() {
+        guard nameValidationMessage == nil else { return }
+        state.renameLastRecording(to: draftName)
+        isEditingName = false
     }
 
     // MARK: - Record control

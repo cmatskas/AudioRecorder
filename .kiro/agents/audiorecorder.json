@@ -1,0 +1,13 @@
+{
+  "name": "audiorecorder",
+  "description": "AudioRecorder dev agent: builds the .app bundle after every turn so a broken build is caught immediately.",
+  "hooks": {
+    "stop": [
+      {
+        "command": "scripts/build-app.sh 2>&1 | tail -30",
+        "timeout_ms": 600000,
+        "max_output_size": 20000
+      }
+    ]
+  }
+}

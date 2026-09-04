@@ -14,6 +14,14 @@ struct AudioRecorderApp: App {
             AWSInsightsPipeline(configuration: configuration, model: model)
         }
         state.insightsValidator = STSCredentialsValidator()
+        // Recording names: one Bedrock call for the title, and — only if the
+        // user picks that backend — Amazon Transcribe for the transcript.
+        state.llmClientFactory = { configuration in
+            LazyBedrockClient(configuration: configuration)
+        }
+        state.cloudNamingTranscriberFactory = { configuration in
+            AWSFileTranscriber(configuration: configuration)
+        }
         _state = StateObject(wrappedValue: state)
     }
 

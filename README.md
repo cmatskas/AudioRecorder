@@ -25,6 +25,9 @@ prompt instead of a driver install and an audio-routing detour.
   written independently so a failing disk cannot take both down
 - **Automatic crash recovery** — interrupted recordings are detected on launch
   and can be finished with one click
+- **Named by what they are about** — a finished recording is called
+  `Pricing Call`, not `recording_2026-09-03_19-45-58`
+- **Renamable in the app** — click the name, type a new one, press Save
 - **Native sample rates preserved** — sources are recorded separately and merged
   afterwards, so a 24 kHz Bluetooth mic never drags 48 kHz system audio down
 - **AAC `.m4a` output**, with the lossless PCM masters kept in the backup folder
@@ -49,6 +52,47 @@ On first recording macOS will ask for two permissions:
 
 Both are requested only when you start recording, and can be revoked in System
 Settings → Privacy & Security.
+
+**Speech Recognition** is requested separately, the first time a finished
+recording is named on-device. Denying it only costs you automatic names.
+
+## Recording names
+
+A finished recording is named after what it was about — under 15 characters, so
+it reads at a glance in Finder and in the app's History list. Naming happens
+*after* the audio is safely written and can never delay or endanger it; if it
+fails for any reason the recording simply keeps its `recording_<timestamp>` name.
+
+The name needs words, so something has to transcribe the conversation. Pick the
+backend in the Auto-name row:
+
+| Backend | What leaves your Mac | Cost |
+|---|---|---|
+| **On-device** (default) | nothing — Apple's speech recognition runs locally | none |
+| **Live transcript only** | nothing extra; uses the Live Insights transcript when there is one | none |
+| **Amazon Transcribe** | the first 3 minutes of the finished recording | billed per second of streamed audio |
+
+Only the opening of a recording is transcribed: a conversation establishes its
+topic early, which keeps the wait short and, for the cloud backend, the bill
+small. Amazon Transcribe is never used without an explicit confirmation that says
+so, and it reuses the credentials and region Live Insights is configured with —
+no S3 bucket and no extra IAM permissions.
+
+The name itself comes from the configured **deep** model (the same one Live
+Insights uses for its briefings) when insights credentials exist, and from a local
+keyword heuristic when they do not. It is one short call, with a second only if the
+first answer runs over 14 characters — models are unreliable about length, so an
+over-long answer is quoted back once with a request to shorten it. Anything still
+too long is shortened by dropping whole words, never by cutting mid-phrase.
+
+To rename a recording yourself, click its name at the bottom of the Record tab
+(or Rename in the History tab), type, and press Save. Renaming here rather than
+in Finder matters: the app finds a session's audio by the name in its
+`session.json`, so a rename behind its back would lose the recording from
+History. Renaming updates the `.m4a` in both destinations, the transcript
+exports beside it, and the manifest — together. The session directory in the
+backup folder keeps its timestamp name as a stable, collision-proof identity, and
+the manifest remembers the original name.
 
 ## Build from source
 
@@ -117,7 +161,9 @@ swift test
 The suite covers the ring buffer, CAF crash-safety (a file abandoned without
 finalizing must still be fully readable), rate-mismatched merging, timeline
 alignment from anchors, dropout gap filling, uneven track lengths, manifest
-migration, and crash recovery from unfinalized streams.
+migration, crash recovery from unfinalized streams, name sanitizing and the
+offline title heuristic, the rename operation (including collisions, rejected
+names, and an unwritable destination), and audio chunking for naming.
 
 ## License
 

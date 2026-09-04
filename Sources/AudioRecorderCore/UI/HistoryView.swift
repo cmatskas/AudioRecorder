@@ -7,6 +7,9 @@ public struct HistoryView: View {
     @EnvironmentObject private var state: AppState
     @StateObject private var model = HistoryViewModel()
     @State private var showExport = false
+    @State private var isEditingName = false
+    @State private var draftName = ""
+    @FocusState private var nameFieldFocused: Bool
 
     public init() {}
 
@@ -115,6 +118,7 @@ public struct HistoryView: View {
 
     private func detail(for item: HistoryItem) -> some View {
         VStack(alignment: .leading, spacing: 10) {
+            nameRow(for: item)
             HStack(spacing: 10) {
                 if item.audioURL != nil {
                     Button {
@@ -160,6 +164,70 @@ public struct HistoryView: View {
             RoundedRectangle(cornerRadius: 10)
                 .strokeBorder(Color.primary.opacity(0.08))
         )
+    }
+
+    /// The recording's name, editable here as well as on the Record tab — both
+    /// go through `SessionRenamer`, so the manifest and the files on disk never
+    /// disagree about what a recording is called.
+    @ViewBuilder
+    private func nameRow(for item: HistoryItem) -> some View {
+        HStack(spacing: 8) {
+            if isEditingName {
+                TextField("Recording name", text: $draftName)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($nameFieldFocused)
+                    .onSubmit { commitName(for: item) }
+                    .frame(maxWidth: 240)
+                Button("Save") { commitName(for: item) }
+                    .controlSize(.small)
+                    .buttonStyle(.borderedProminent)
+                    .disabled(nameValidationMessage != nil)
+                Button("Cancel") { isEditingName = false }
+                    .controlSize(.small)
+                if let message = nameValidationMessage {
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .lineLimit(2)
+                }
+            } else {
+                Text(item.name)
+                    .font(.callout.weight(.medium))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Button {
+                    draftName = item.name
+                    isEditingName = true
+                    nameFieldFocused = true
+                } label: {
+                    Label("Rename", systemImage: "pencil")
+                }
+                .controlSize(.small)
+                .disabled(state.isRecording || state.isSaving || state.isRenaming)
+                .accessibilityHint("Rename this recording")
+            }
+            Spacer()
+        }
+        .onChange(of: item.id) { _, _ in isEditingName = false }
+    }
+
+    private var nameValidationMessage: String? {
+        switch SessionRenamer.validate(draftName) {
+        case .success:
+            return nil
+        case let .failure(error):
+            return error.errorDescription
+        }
+    }
+
+    private func commitName(for item: HistoryItem) {
+        guard nameValidationMessage == nil else { return }
+        isEditingName = false
+        state.rename(item, to: draftName) { success in
+            if success {
+                model.refresh(root: state.backupRoot)
+            }
+        }
     }
 
     @ViewBuilder

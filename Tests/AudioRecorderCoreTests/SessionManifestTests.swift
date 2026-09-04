@@ -37,10 +37,85 @@ final class SessionManifestTests: XCTestCase {
 
         let loaded = try SessionManifest.load(from: root)
         XCTAssertEqual(loaded, manifest)
-        XCTAssertEqual(loaded.version, 2)
+        XCTAssertEqual(loaded.version, SessionManifest.currentVersion)
         XCTAssertEqual(loaded.tracks.count, 2)
         XCTAssertEqual(loaded.mergedSampleRate, 48_000)
         XCTAssertEqual(loaded.track(labeled: "mic")?.sampleRate, 24_000)
+    }
+
+    /// A new manifest's display name and original name start out identical;
+    /// renaming moves them apart and both survive a round trip.
+    func testOriginalNameSurvivesRename() throws {
+        var manifest = SessionManifest(
+            name: "recording_2026-09-03_19-45-58",
+            micName: nil,
+            tracks: [
+                SessionManifest.Track(
+                    label: "mic", sampleRate: 48_000, channels: 2,
+                    hostTicksPerSecond: 1_000_000_000
+                )
+            ]
+        )
+        XCTAssertEqual(manifest.originalName, manifest.name)
+
+        manifest.name = "Pricing Call"
+        try manifest.save(to: root)
+
+        let loaded = try SessionManifest.load(from: root)
+        XCTAssertEqual(loaded.version, 3)
+        XCTAssertEqual(loaded.name, "Pricing Call")
+        XCTAssertEqual(loaded.originalName, "recording_2026-09-03_19-45-58")
+    }
+
+    /// Version 2 manifests predate renaming, so the name they carry *is* the
+    /// original name. They must load without a migration step.
+    func testVersion2ManifestDecodesOriginalNameFromName() throws {
+        let v2 = """
+        {
+          "createdAt" : "2026-08-27T21:39:30Z",
+          "micName" : "MacBook Pro Microphone",
+          "name" : "recording_2026-08-27_14-39-30",
+          "status" : "complete",
+          "tracks" : [
+            {
+              "anchorHostTime" : 42,
+              "channels" : 2,
+              "hostTicksPerSecond" : 1000000000,
+              "label" : "mic",
+              "sampleRate" : 48000,
+              "segments" : [ "mic_001.caf" ]
+            }
+          ],
+          "version" : 2
+        }
+        """
+        try v2.write(
+            to: root.appendingPathComponent(SessionManifest.filename),
+            atomically: true, encoding: .utf8
+        )
+
+        let loaded = try SessionManifest.load(from: root)
+        XCTAssertEqual(loaded.version, 2)
+        XCTAssertEqual(loaded.name, "recording_2026-08-27_14-39-30")
+        XCTAssertEqual(loaded.originalName, "recording_2026-08-27_14-39-30")
+        XCTAssertEqual(loaded.tracks.count, 1)
+    }
+
+    /// The v1 migration path must fill in `originalName` too.
+    func testVersion1MigrationFillsOriginalName() throws {
+        let v1 = """
+        {
+          "channels" : 2, "createdAt" : "2026-08-27T21:39:30Z",
+          "name" : "legacy", "sampleRate" : 44100,
+          "segments" : [ "segment_001.caf" ], "status" : "complete", "version" : 1
+        }
+        """
+        try v1.write(
+            to: root.appendingPathComponent(SessionManifest.filename),
+            atomically: true, encoding: .utf8
+        )
+        let loaded = try SessionManifest.load(from: root)
+        XCTAssertEqual(loaded.originalName, "legacy")
     }
 
     /// Version 1 manifests described a single pre-merged stream at the top

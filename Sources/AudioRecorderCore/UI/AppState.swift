@@ -23,6 +23,10 @@ public final class AppState: ObservableObject {
     @Published public var statusMessage: String?
     @Published public var errorMessage: String?
     @Published public private(set) var lastSavedURL: URL?
+    /// Display name of the last finished recording, shown as an editable field.
+    @Published public private(set) var lastSavedName: String?
+    /// Session directory of the last finished recording: what a rename acts on.
+    @Published public private(set) var lastSavedSessionDirectory: URL?
     @Published public private(set) var recoveryItems: [RecoveryManager.RecoveryItem] = []
     @Published public private(set) var userDestination: URL?
     /// Sample rate of the microphone track, if active.
@@ -63,6 +67,74 @@ public final class AppState: ObservableObject {
 
     private var insightsPipeline: InsightsPipeline?
     private static let insightsEnabledKey = "insightsEnabled"
+
+    // MARK: - Naming state
+
+    /// Where the text used to name a recording comes from.
+    public enum NamingBackend: String, Codable, Sendable, CaseIterable {
+        /// Only a Live Insights transcript, if there happens to be one. Nothing
+        /// extra is transcribed and no audio ever leaves the machine.
+        case transcriptOnly
+        /// Apple's on-device speech recognition over the recording's opening.
+        case onDevice
+        /// Amazon Transcribe, which means uploading that opening window.
+        case amazonTranscribe
+
+        public var label: String {
+            switch self {
+            case .transcriptOnly: return "Live transcript only"
+            case .onDevice: return "On-device"
+            case .amazonTranscribe: return "Amazon Transcribe"
+            }
+        }
+    }
+
+    /// Master switch for content-based naming. Recording never depends on it.
+    @Published public var autoNameRecordings: Bool {
+        didSet {
+            UserDefaults.standard.set(autoNameRecordings, forKey: Self.autoNameKey)
+        }
+    }
+
+    /// Which transcription backend naming may use.
+    @Published public var namingBackend: NamingBackend {
+        didSet {
+            guard oldValue != namingBackend else { return }
+            // Uploading audio is never a side effect of a picker: Live Insights
+            // being off must not be quietly overridden by naming.
+            if namingBackend == .amazonTranscribe && !cloudNamingConsentGranted {
+                namingBackend = oldValue
+                showCloudNamingConsent = true
+                return
+            }
+            UserDefaults.standard.set(namingBackend.rawValue, forKey: Self.namingBackendKey)
+            refreshNamingAvailability()
+        }
+    }
+
+    /// True while a name is being derived for the recording just saved.
+    @Published public private(set) var isNaming = false
+    /// True while a rename is being applied.
+    @Published public private(set) var isRenaming = false
+    /// Set when the selected backend cannot run (no model, permission denied),
+    /// so settings can say so instead of naming failing invisibly.
+    @Published public private(set) var namingAvailabilityNote: String?
+    /// Drives the one-time confirmation before audio may be sent for naming.
+    @Published public var showCloudNamingConsent = false
+
+    /// Builds the model client used for titles. Injected by the app target, the
+    /// same seam as `insightsFactory`.
+    public var llmClientFactory: ((InsightsConfiguration) -> any LLMClient)?
+    /// Builds the cloud transcription backend. Injected by the app target.
+    public var cloudNamingTranscriberFactory: ((InsightsConfiguration) -> any NamingTranscriber)?
+
+    private var namingTask: Task<Void, Never>?
+    private var cloudNamingConsentGranted: Bool
+    private static let autoNameKey = "autoNameRecordings"
+    private static let namingBackendKey = "namingBackend"
+    private static let cloudNamingConsentKey = "namingCloudConsentGranted"
+    /// How much of a recording's opening may be transcribed for naming.
+    public static let namingTranscriptionWindow: TimeInterval = 180
 
     private let updateChecker = UpdateChecker()
 
@@ -110,6 +182,16 @@ public final class AppState: ObservableObject {
     public init() {
         insightsConfiguration = InsightsConfiguration.load()
         insightsEnabled = UserDefaults.standard.bool(forKey: Self.insightsEnabledKey)
+        let defaults = UserDefaults.standard
+        // Naming defaults to on, and to the backend that keeps audio local.
+        autoNameRecordings = defaults.object(forKey: Self.autoNameKey) as? Bool ?? true
+        cloudNamingConsentGranted = defaults.bool(forKey: Self.cloudNamingConsentKey)
+        let storedBackend = defaults.string(forKey: Self.namingBackendKey)
+            .flatMap(NamingBackend.init(rawValue:)) ?? .onDevice
+        // A stored cloud choice is honoured only while consent stands.
+        namingBackend = (storedBackend == .amazonTranscribe && !cloudNamingConsentGranted)
+            ? .onDevice
+            : storedBackend
         backupRoot = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("AudioRecorderBackups", isDirectory: true)
         try? FileManager.default.createDirectory(at: backupRoot, withIntermediateDirectories: true)
@@ -127,6 +209,7 @@ public final class AppState: ObservableObject {
         isInitializing = false
         rebuildEngine()
         checkForUpdates()
+        refreshNamingAvailability()
     }
 
     deinit {
@@ -274,6 +357,9 @@ public final class AppState: ObservableObject {
         }
         errorMessage = nil
         statusMessage = nil
+        // Naming the previous recording must never compete with capturing the
+        // next one; it is a convenience and loses by design.
+        cancelNaming()
         Task { @MainActor in
             if selectedMic != nil {
                 let granted = await AVCaptureDevice.requestAccess(for: .audio)
@@ -337,18 +423,27 @@ public final class AppState: ObservableObject {
         let pipeline = insightsPipeline
         insightsPipeline = nil
         Task.detached(priority: .userInitiated) {
+            var sessionDirectory: URL?
+            var audioForNaming: URL?
             do {
                 let result = try activeSession.stopAndFinalize()
+                sessionDirectory = result.sessionDirectory
+                audioForNaming = result.backupM4A ?? result.userM4A
                 await MainActor.run { [weak self] in
                     guard let self else { return }
                     self.isSaving = false
                     let saved = result.userM4A ?? result.backupM4A
                     self.lastSavedURL = saved
-                    var message = "Saved \(saved?.lastPathComponent ?? result.sessionDirectory.lastPathComponent)"
+                    self.lastSavedSessionDirectory = result.sessionDirectory
+                    self.lastSavedName = saved?.deletingPathExtension().lastPathComponent
+                        ?? result.sessionDirectory.lastPathComponent
+                    // The file name is its own control now, so the banner is
+                    // left for what actually needs saying.
                     if !result.warnings.isEmpty {
-                        message += "\n⚠ " + result.warnings.joined(separator: "\n⚠ ")
+                        self.statusMessage = "⚠ " + result.warnings.joined(separator: "\n⚠ ")
+                    } else {
+                        self.statusMessage = nil
                     }
-                    self.statusMessage = message
                 }
             } catch {
                 await MainActor.run { [weak self] in
@@ -365,7 +460,226 @@ public final class AppState: ObservableObject {
                     self?.insightsSessionActive = false
                 }
             }
+            // Naming comes last: it needs the finished file and, when there was
+            // one, the complete transcript.
+            if let sessionDirectory {
+                await MainActor.run { [weak self] in
+                    self?.startNaming(
+                        sessionDirectory: sessionDirectory, audioURL: audioForNaming
+                    )
+                }
+            }
         }
+    }
+
+    // MARK: - Naming
+
+    /// Derives a content-based name for the recording just saved and applies it.
+    /// Every failure path here is silent: the recording keeps its timestamp name.
+    private func startNaming(sessionDirectory: URL, audioURL: URL?) {
+        guard autoNameRecordings else { return }
+        let namer = makeNamer()
+        // With no transcriber, no live transcript and no summary there is
+        // nothing to read.
+        let liveTranscript = TranscriptStore.dialogue(insightsModel.utterances)
+        let summary = insightsModel.summary
+        guard namer.transcriber != nil || !liveTranscript.isEmpty || !summary.isEmpty else {
+            return
+        }
+        let inputs = RecordingNamer.Inputs(
+            audioURL: audioURL,
+            liveTranscript: liveTranscript,
+            summary: summary
+        )
+        let destination = userDestination
+        isNaming = true
+        namingTask = Task { [weak self] in
+            let proposed = await namer.proposeName(inputs)
+            guard !Task.isCancelled else {
+                await MainActor.run { self?.isNaming = false }
+                return
+            }
+            var applied: SessionRenamer.Outcome?
+            if let proposed {
+                applied = try? SessionRenamer.rename(
+                    SessionRenamer.Request(
+                        sessionDirectory: sessionDirectory,
+                        userDestinationRoot: destination,
+                        newName: proposed
+                    ),
+                    allowSuffix: true,
+                    limit: RecordingTitler.maxLength
+                )
+            }
+            await MainActor.run {
+                guard let self else { return }
+                self.isNaming = false
+                guard !Task.isCancelled, let applied else { return }
+                self.apply(applied, sessionDirectory: sessionDirectory)
+            }
+        }
+    }
+
+    private func makeNamer() -> RecordingNamer {
+        var llm: (any LLMClient)?
+        var titleModelID: String?
+        if let configuration = insightsConfiguration, let factory = llmClientFactory {
+            llm = factory(configuration)
+            // The deep model, not the fast one. Naming is one short call per
+            // recording, and the difference in quality is stark: asked to name a
+            // talk about childhood labels, nova-lite answers "Impact of
+            // Childhood Labels" (26 characters) while Claude answers "Broken
+            // Brain". A cheap model is the right call for the live suggestion
+            // lane, which runs every few seconds; it is the wrong one here.
+            titleModelID = configuration.deepModelID.isEmpty
+                ? configuration.fastModelID
+                : configuration.deepModelID
+        }
+        return RecordingNamer(
+            transcriber: makeNamingTranscriber(),
+            llm: llm,
+            titleModelID: titleModelID,
+            maxTranscriptionDuration: Self.namingTranscriptionWindow
+        )
+    }
+
+    private func makeNamingTranscriber() -> (any NamingTranscriber)? {
+        switch namingBackend {
+        case .transcriptOnly:
+            return nil
+        case .onDevice:
+            return LocalSpeechTranscriber()
+        case .amazonTranscribe:
+            guard cloudNamingConsentGranted,
+                  let configuration = insightsConfiguration,
+                  let factory = cloudNamingTranscriberFactory
+            else { return nil }
+            return factory(configuration)
+        }
+    }
+
+    private func cancelNaming() {
+        namingTask?.cancel()
+        namingTask = nil
+        isNaming = false
+    }
+
+    /// Checks whether the selected backend can actually run, so the settings row
+    /// can explain a denial or a missing model rather than staying silent.
+    public func refreshNamingAvailability() {
+        guard namingBackend == .onDevice else {
+            namingAvailabilityNote = nil
+            return
+        }
+        Task { [weak self] in
+            let result = await LocalSpeechTranscriber.availability()
+            await MainActor.run {
+                guard let self, self.namingBackend == .onDevice else { return }
+                switch result {
+                case .success:
+                    self.namingAvailabilityNote = nil
+                case let .failure(error):
+                    self.namingAvailabilityNote = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    /// Records consent to send a window of audio to Amazon Transcribe, and
+    /// switches to that backend. Revocable by switching away.
+    public func grantCloudNamingConsent() {
+        cloudNamingConsentGranted = true
+        UserDefaults.standard.set(true, forKey: Self.cloudNamingConsentKey)
+        showCloudNamingConsent = false
+        namingBackend = .amazonTranscribe
+    }
+
+    public func declineCloudNamingConsent() {
+        showCloudNamingConsent = false
+    }
+
+    // MARK: - Renaming
+
+    /// Applies a hand-typed name to the recording shown at the bottom of the
+    /// Record tab. Reports failures, unlike automatic naming.
+    public func renameLastRecording(to newName: String) {
+        guard !isRecording, !isSaving, !isRenaming,
+              let sessionDirectory = lastSavedSessionDirectory
+        else { return }
+        // A typed name wins over one still being generated.
+        cancelNaming()
+        rename(sessionDirectory: sessionDirectory, to: newName) { [weak self] outcome in
+            guard let self, let outcome else { return }
+            self.apply(outcome, sessionDirectory: sessionDirectory)
+        }
+    }
+
+    /// Renames a past recording from the History tab. `completion` reports
+    /// success so the list can refresh.
+    public func rename(
+        _ item: HistoryItem,
+        to newName: String,
+        completion: (@MainActor (Bool) -> Void)? = nil
+    ) {
+        guard !isRecording, !isSaving, !isRenaming else {
+            completion?(false)
+            return
+        }
+        rename(sessionDirectory: item.directory, to: newName) { [weak self] outcome in
+            if let self, let outcome, self.isLastSaved(item.directory) {
+                self.apply(outcome, sessionDirectory: item.directory)
+            }
+            completion?(outcome != nil)
+        }
+    }
+
+    private func rename(
+        sessionDirectory: URL,
+        to newName: String,
+        then handler: @escaping @MainActor (SessionRenamer.Outcome?) -> Void
+    ) {
+        let request = SessionRenamer.Request(
+            sessionDirectory: sessionDirectory,
+            userDestinationRoot: userDestination,
+            newName: newName
+        )
+        isRenaming = true
+        errorMessage = nil
+        Task.detached(priority: .userInitiated) {
+            let result = Result { try SessionRenamer.rename(request, allowSuffix: false) }
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.isRenaming = false
+                switch result {
+                case let .success(outcome):
+                    if outcome.warnings.isEmpty {
+                        self.statusMessage = nil
+                    } else {
+                        self.statusMessage = "⚠ " + outcome.warnings.joined(separator: "\n⚠ ")
+                    }
+                    handler(outcome)
+                case let .failure(error):
+                    self.errorMessage = error.localizedDescription
+                    handler(nil)
+                }
+            }
+        }
+    }
+
+    /// Reflects a completed rename in the UI.
+    private func apply(_ outcome: SessionRenamer.Outcome, sessionDirectory: URL) {
+        guard isLastSaved(sessionDirectory) else { return }
+        lastSavedName = outcome.name
+        // Prefer the copy in the user's folder, as the save banner does.
+        lastSavedURL = outcome.userAudioURL ?? outcome.backupAudioURL ?? lastSavedURL
+    }
+
+    /// Path comparison, not URL equality: the same directory arrives with and
+    /// without a trailing slash depending on whether it came from a session or
+    /// from a directory scan.
+    private func isLastSaved(_ directory: URL) -> Bool {
+        guard let current = lastSavedSessionDirectory else { return false }
+        return current.standardizedFileURL.path == directory.standardizedFileURL.path
     }
 
     // MARK: - Insights

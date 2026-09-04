@@ -8,6 +8,11 @@ import Foundation
 /// sample rate and a host-time anchor, so tracks recorded from unrelated clocks
 /// can be aligned offline. Version 1 manifests (a single pre-merged stream) are
 /// migrated on read and still recover.
+///
+/// Version 3 adds `originalName`, separating what a recording is *called* from
+/// the timestamp it was created with, so recordings can be renamed — by the
+/// automatic namer or by hand — without losing their chronological identity.
+/// Version 1 and 2 manifests decode with `originalName` equal to `name`.
 public struct SessionManifest: Codable, Equatable, Sendable {
     public enum Status: String, Codable, Sendable {
         case recording
@@ -46,10 +51,17 @@ public struct SessionManifest: Codable, Equatable, Sendable {
     }
 
     public static let filename = "session.json"
-    public static let currentVersion = 2
+    public static let currentVersion = 3
 
     public var version: Int
+    /// Display name: what the recording is called now. Also names the merged
+    /// `.m4a` inside the session directory, so renaming a recording means
+    /// changing this and moving that file together.
     public var name: String
+    /// The timestamp-based name the session was created with. Renaming leaves
+    /// it alone, so a recording's chronological identity is never lost — and
+    /// the session directory on disk keeps this name regardless of renames.
+    public var originalName: String
     public var status: Status
     public var createdAt: Date
     public var micName: String?
@@ -58,6 +70,7 @@ public struct SessionManifest: Codable, Equatable, Sendable {
     public init(name: String, micName: String?, tracks: [Track]) {
         self.version = Self.currentVersion
         self.name = name
+        self.originalName = name
         self.status = .recording
         self.createdAt = Date()
         self.micName = micName
@@ -96,7 +109,7 @@ public struct SessionManifest: Codable, Equatable, Sendable {
     // MARK: - Codable with v1 migration
 
     private enum CodingKeys: String, CodingKey {
-        case version, name, status, createdAt, micName, tracks
+        case version, name, originalName, status, createdAt, micName, tracks
         // v1-only keys
         case sampleRate, channels, segments, systemAudio
     }
@@ -105,6 +118,9 @@ public struct SessionManifest: Codable, Equatable, Sendable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         version = try container.decodeIfPresent(Int.self, forKey: .version) ?? 1
         name = try container.decode(String.self, forKey: .name)
+        // Versions 1 and 2 had no concept of renaming, so the name they carry
+        // *is* the original name.
+        originalName = try container.decodeIfPresent(String.self, forKey: .originalName) ?? name
         status = try container.decode(Status.self, forKey: .status)
         createdAt = try container.decode(Date.self, forKey: .createdAt)
         micName = try container.decodeIfPresent(String.self, forKey: .micName)
@@ -133,6 +149,7 @@ public struct SessionManifest: Codable, Equatable, Sendable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(version, forKey: .version)
         try container.encode(name, forKey: .name)
+        try container.encode(originalName, forKey: .originalName)
         try container.encode(status, forKey: .status)
         try container.encode(createdAt, forKey: .createdAt)
         try container.encodeIfPresent(micName, forKey: .micName)

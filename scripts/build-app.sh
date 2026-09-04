@@ -68,6 +68,8 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
     <string>Audio Recorder captures your selected microphone while recording.</string>
     <key>NSAudioCaptureUsageDescription</key>
     <string>Audio Recorder captures system audio so recordings include what your Mac plays.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>Audio Recorder transcribes the first few minutes of a finished recording on this Mac to name the file after what it was about.</string>
 </dict>
 </plist>
 PLIST

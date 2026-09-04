@@ -5,15 +5,18 @@ import Foundation
 /// insights pipeline can go live the instant transcription connects instead
 /// of gating on SDK client setup. The client is built once and cached;
 /// a failed construction is not cached, so the next call retries.
-actor LazyBedrockClient: LLMClient {
+///
+/// Public because recording naming also needs one model call, made outside the
+/// insights pipeline: `AppState` is handed a factory for this type.
+public actor LazyBedrockClient: LLMClient {
     private let configuration: InsightsConfiguration
     private var client: BedrockLLMClient?
 
-    init(configuration: InsightsConfiguration) {
+    public init(configuration: InsightsConfiguration) {
         self.configuration = configuration
     }
 
-    func complete(modelID: String, system: String, user: String) async throws -> String {
+    public func complete(modelID: String, system: String, user: String) async throws -> String {
         let client = try await resolvedClient()
         return try await client.complete(modelID: modelID, system: system, user: user)
     }
