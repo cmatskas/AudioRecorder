@@ -83,7 +83,11 @@ jobs:
   release:
     name: Build, notarize and publish
     needs: verify
-    runs-on: macos-15
+    # macOS 26 image: LocalSpeechTranscriber compiles against the
+    # SpeechAnalyzer/SpeechTranscriber API, which only exists in the macOS 26
+    # SDK. The #available guards in that file handle *runtime* support on
+    # macOS 15, but the symbols must still exist at compile time.
+    runs-on: macos-26
     env:
       APP_NAME: AudioRecorder
       BUNDLE_ID: dev.cmatskas.AudioRecorder

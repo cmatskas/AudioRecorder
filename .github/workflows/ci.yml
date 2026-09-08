@@ -14,7 +14,11 @@ concurrency:
 jobs:
   test:
     name: Build and test
-    runs-on: macos-15
+    # macOS 26 image: LocalSpeechTranscriber compiles against the
+    # SpeechAnalyzer/SpeechTranscriber API, which only exists in the macOS 26
+    # SDK. The #available guards in that file handle *runtime* support on
+    # macOS 15, but the symbols must still exist at compile time.
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
 
