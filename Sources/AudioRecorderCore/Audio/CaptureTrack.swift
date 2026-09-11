@@ -15,6 +15,11 @@ import Synchronization
 /// `anchorHostTime + N / sampleRate`, so two tracks recorded from unrelated
 /// clocks can be aligned offline from their anchors alone — no cross-source
 /// coordination happens on the real-time thread.
+///
+/// Muting substitutes silence for the incoming samples rather than dropping
+/// them, for the same reason gaps are filled: the frame count must stay
+/// proportional to wall-clock time or the offline merge would pull everything
+/// after the muted span backwards in time.
 public final class CaptureTrack: @unchecked Sendable {
     /// Stalls shorter than this are ignored as ordinary jitter.
     private static let gapToleranceSeconds = 0.02
@@ -35,6 +40,8 @@ public final class CaptureTrack: @unchecked Sendable {
     private let frames = Atomic<Int>(0)
     private let dropped = Atomic<Int>(0)
     private let gapFilled = Atomic<Int>(0)
+    private let muted = Atomic<Bool>(false)
+    private let mutedFrames = Atomic<Int>(0)
 
     private let silence: UnsafeMutablePointer<Float>
     private var hostTicksPerSecond: Double
@@ -73,6 +80,18 @@ public final class CaptureTrack: @unchecked Sendable {
     public var framesWritten: Int { frames.load(ordering: .relaxed) }
     public var framesDropped: Int { dropped.load(ordering: .relaxed) }
     public var framesGapFilled: Int { gapFilled.load(ordering: .relaxed) }
+    /// Frames written as silence because the source was muted.
+    public var framesMuted: Int { mutedFrames.load(ordering: .relaxed) }
+
+    /// Whether incoming audio is being replaced with silence.
+    public var isMuted: Bool { muted.load(ordering: .acquiring) }
+
+    /// Mutes or unmutes this source. Safe to call at any time, including
+    /// mid-recording: the destinations, writers and timeline are unaffected,
+    /// so only the audio content changes.
+    public func setMuted(_ value: Bool) {
+        muted.store(value, ordering: .releasing)
+    }
     public var ticksPerSecond: Double { hostTicksPerSecond }
 
     /// Attaches destinations and resets the timeline. Passing an empty array
@@ -86,6 +105,7 @@ public final class CaptureTrack: @unchecked Sendable {
             frames.store(0, ordering: .relaxed)
             dropped.store(0, ordering: .relaxed)
             gapFilled.store(0, ordering: .relaxed)
+            mutedFrames.store(0, ordering: .relaxed)
         }
     }
 
@@ -133,8 +153,25 @@ public final class CaptureTrack: @unchecked Sendable {
             }
         }
 
-        writeToSinks(data, frameCount: frameCount)
+        if muted.load(ordering: .acquiring) {
+            writeSilence(frameCount: frameCount)
+            _ = mutedFrames.wrappingAdd(frameCount, ordering: .relaxed)
+        } else {
+            writeToSinks(data, frameCount: frameCount)
+        }
         _ = frames.wrappingAdd(frameCount, ordering: .relaxed)
+    }
+
+    /// Writes `frameCount` frames of silence, chunked to the preallocated
+    /// buffer so the real-time path never allocates.
+    @inline(__always)
+    private func writeSilence(frameCount: Int) {
+        var remaining = frameCount
+        while remaining > 0 {
+            let chunk = min(remaining, Self.silenceChunkFrames)
+            writeToSinks(silence, frameCount: chunk)
+            remaining -= chunk
+        }
     }
 
     @inline(__always)

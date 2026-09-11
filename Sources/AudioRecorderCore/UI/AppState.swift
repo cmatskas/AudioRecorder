@@ -18,6 +18,10 @@ public final class AppState: ObservableObject {
         didSet { if oldValue != systemAudioEnabled { rebuildEngine() } }
     }
     @Published public private(set) var isRecording = false
+    /// Live mute per source. Muting replaces that source's audio with silence
+    /// for as long as it is on; the recording itself continues uninterrupted.
+    @Published public private(set) var micMuted = false
+    @Published public private(set) var systemMuted = false
     @Published public private(set) var isSaving = false
     @Published public private(set) var recordingStart: Date?
     @Published public var statusMessage: String?
@@ -395,6 +399,10 @@ public final class AppState: ObservableObject {
                 session = newSession
                 isRecording = true
                 recordingStart = Date()
+                // Always start unmuted: a mute left on from a previous
+                // recording would silently produce a silent one.
+                setMuted(false, forSource: "mic")
+                setMuted(false, forSource: "system")
 
                 if let pipeline {
                     pipeline.start(
@@ -680,6 +688,27 @@ public final class AppState: ObservableObject {
     private func isLastSaved(_ directory: URL) -> Bool {
         guard let current = lastSavedSessionDirectory else { return false }
         return current.standardizedFileURL.path == directory.standardizedFileURL.path
+    }
+
+    // MARK: - Mute
+
+    /// Mutes or unmutes a source mid-recording. Safe at any time: capture,
+    /// destinations and timing are untouched, only the audio content changes.
+    public func setMuted(_ muted: Bool, forSource label: String) {
+        engine?.setMuted(muted, forSource: label)
+        switch label {
+        case "mic": micMuted = muted
+        case "system": systemMuted = muted
+        default: break
+        }
+    }
+
+    public func toggleMicMuted() {
+        setMuted(!micMuted, forSource: "mic")
+    }
+
+    public func toggleSystemMuted() {
+        setMuted(!systemMuted, forSource: "system")
     }
 
     // MARK: - Insights

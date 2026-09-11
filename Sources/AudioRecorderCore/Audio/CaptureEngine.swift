@@ -89,6 +89,20 @@ public final class CaptureEngine: @unchecked Sendable {
         (micTrack?.framesGapFilled ?? 0) + (systemTrack?.framesGapFilled ?? 0)
     }
 
+    public var micFramesMuted: Int { micTrack?.framesMuted ?? 0 }
+    public var systemFramesMuted: Int { systemTrack?.framesMuted ?? 0 }
+
+    /// Replaces a source's audio with silence without disturbing capture.
+    /// Unlike changing the source configuration, this is safe mid-recording:
+    /// the IO procs, ring buffers, writers and host-time anchors are untouched.
+    public func setMuted(_ muted: Bool, forSource label: String) {
+        switch label {
+        case "mic": micTrack?.setMuted(muted)
+        case "system": systemTrack?.setMuted(muted)
+        default: break
+        }
+    }
+
     // MARK: - Lifecycle
 
     public func prepare(_ config: Configuration) throws {
@@ -304,12 +318,18 @@ public final class CaptureEngine: @unchecked Sendable {
         return frameCount
     }
 
+    /// Publishes levels for a source. A muted source reads zero: the meter
+    /// describes what is being recorded, so showing live levels while silence
+    /// is written would misrepresent the recording.
     @inline(__always)
     private func publishMeter(_ data: UnsafePointer<Float>, frames: Int, isMic: Bool) {
         var left: Float = 0
         var right: Float = 0
-        vDSP_rmsqv(data, 2, &left, vDSP_Length(frames))
-        vDSP_rmsqv(data + 1, 2, &right, vDSP_Length(frames))
+        let muted = isMic ? (micTrack?.isMuted ?? false) : (systemTrack?.isMuted ?? false)
+        if !muted {
+            vDSP_rmsqv(data, 2, &left, vDSP_Length(frames))
+            vDSP_rmsqv(data + 1, 2, &right, vDSP_Length(frames))
+        }
         if isMic {
             meters.setMic(left: left, right: right)
         } else {

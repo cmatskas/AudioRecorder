@@ -338,6 +338,15 @@ public final class RecordingSession: @unchecked Sendable {
             )
         }
 
+        // A partly silent recording is never left to be discovered on playback.
+        for (label, muted, rate) in [
+            ("Microphone", engine.micFramesMuted, engine.micTrack?.sampleRate),
+            ("System audio", engine.systemFramesMuted, engine.systemTrack?.sampleRate),
+        ] where muted > 0 {
+            let seconds = Int((Double(muted) / (rate ?? 48_000)).rounded())
+            warnings.append("\(label) was muted for about \(seconds)s of this recording")
+        }
+
         return Result(
             backupM4A: backupM4A,
             userM4A: userM4A,

@@ -154,7 +154,9 @@ public struct ContentView: View {
                     isOn: $state.micEnabled,
                     levels: levels.mic,
                     enabled: state.micEnabled,
-                    rate: state.micSampleRate
+                    rate: state.micSampleRate,
+                    isMuted: state.micMuted,
+                    toggleMute: state.toggleMicMuted
                 ) {
                     Picker("Microphone", selection: $state.selectedMicUID) {
                         ForEach(state.devices) { device in
@@ -170,7 +172,9 @@ public struct ContentView: View {
                     isOn: $state.systemAudioEnabled,
                     levels: levels.system,
                     enabled: state.systemAudioEnabled,
-                    rate: state.systemSampleRate
+                    rate: state.systemSampleRate,
+                    isMuted: state.systemMuted,
+                    toggleMute: state.toggleSystemMuted
                 ) {
                     Text("Everything your Mac plays")
                         .font(.caption)
@@ -189,6 +193,8 @@ public struct ContentView: View {
         levels: (Float, Float),
         enabled: Bool,
         rate: Double?,
+        isMuted: Bool,
+        toggleMute: @escaping () -> Void,
         @ViewBuilder detail: () -> Content
     ) -> some View {
         VStack(spacing: 10) {
@@ -197,6 +203,26 @@ public struct ContentView: View {
                     .font(.headline)
                     .labelStyle(.titleAndIcon)
                 Spacer()
+                // Sources cannot be added or removed mid-recording (the track
+                // layout and timing anchors are fixed when the session starts),
+                // but they can be muted, which only substitutes silence.
+                if state.isRecording, enabled {
+                    Button(action: toggleMute) {
+                        Image(
+                            systemName: isMuted
+                                ? "\(icon.hasPrefix("mic") ? "mic" : "speaker").slash.fill"
+                                : "\(icon.hasPrefix("mic") ? "mic" : "speaker").fill"
+                        )
+                        .foregroundStyle(isMuted ? Color.orange : Color.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help(
+                        isMuted
+                            ? "Unmute — resume recording this source"
+                            : "Mute — record silence for this source"
+                    )
+                    .accessibilityLabel(isMuted ? "Unmute \(title)" : "Mute \(title)")
+                }
                 Toggle("", isOn: isOn)
                     .toggleStyle(.switch)
                     .controlSize(.small)
@@ -205,7 +231,13 @@ public struct ContentView: View {
             }
             detail()
             StereoVUMeter(title: title, left: levels.0, right: levels.1, enabled: enabled)
-            rateBadge(rate: rate, enabled: enabled)
+            if isMuted {
+                Label("Muted — recording silence", systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            } else {
+                rateBadge(rate: rate, enabled: enabled)
+            }
         }
         .padding(12)
         .frame(maxWidth: .infinity)

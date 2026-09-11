@@ -123,4 +123,95 @@ final class CaptureTrackTests: XCTestCase {
         XCTAssertEqual(track.framesWritten, 0)
         XCTAssertEqual(track.anchorHostTime, 0)
     }
+
+    // MARK: - Mute
+
+    /// Muting must substitute silence rather than drop frames: dropping would
+    /// shorten the track and pull everything after the muted span backwards in
+    /// the merged timeline.
+    func testMutedAppendWritesSilenceButKeepsTheTimeline() {
+        let (track, ring) = makeTrack()
+        let tone = [Float](repeating: 0.5, count: 512 * 2)
+        let second = ticks(1) + UInt64(512.0 / rate * ticksPerSecond)
+
+        tone.withUnsafeBufferPointer {
+            track.append($0.baseAddress!, frameCount: 512, hostTime: ticks(1))
+        }
+        track.setMuted(true)
+        tone.withUnsafeBufferPointer {
+            track.append($0.baseAddress!, frameCount: 512, hostTime: second)
+        }
+
+        XCTAssertEqual(track.framesWritten, 1024, "muted frames must still be written")
+        XCTAssertEqual(track.framesMuted, 512)
+
+        var output = [Float](repeating: -1, count: 1024 * 2)
+        let read = output.withUnsafeMutableBufferPointer {
+            ring.read(into: $0.baseAddress!, maxCount: $0.count)
+        }
+        XCTAssertEqual(read, 1024 * 2)
+        XCTAssertTrue(
+            output[0..<(512 * 2)].allSatisfy { $0 == 0.5 }, "first buffer should be audible"
+        )
+        XCTAssertTrue(
+            output[(512 * 2)...].allSatisfy { $0 == 0 }, "muted buffer should be silence"
+        )
+    }
+
+    func testUnmutingRestoresAudio() {
+        let (track, ring) = makeTrack()
+        let tone = [Float](repeating: 0.25, count: 256 * 2)
+        let second = ticks(1) + UInt64(256.0 / rate * ticksPerSecond)
+
+        track.setMuted(true)
+        tone.withUnsafeBufferPointer {
+            track.append($0.baseAddress!, frameCount: 256, hostTime: ticks(1))
+        }
+        track.setMuted(false)
+        tone.withUnsafeBufferPointer {
+            track.append($0.baseAddress!, frameCount: 256, hostTime: second)
+        }
+
+        XCTAssertEqual(track.framesMuted, 256, "only the muted span should be counted")
+        var output = [Float](repeating: -1, count: 512 * 2)
+        _ = output.withUnsafeMutableBufferPointer {
+            ring.read(into: $0.baseAddress!, maxCount: $0.count)
+        }
+        XCTAssertTrue(output[0..<(256 * 2)].allSatisfy { $0 == 0 })
+        XCTAssertTrue(output[(256 * 2)...].allSatisfy { $0 == 0.25 })
+    }
+
+    func testMuteStateIsReadableAndSurvivesSinkChanges() {
+        let track = CaptureTrack(label: "test", sampleRate: rate)
+        XCTAssertFalse(track.isMuted)
+        track.setMuted(true)
+        XCTAssertTrue(track.isMuted)
+        // Attaching sinks resets counters but must not silently unmute.
+        track.setSinks([RingBuffer(capacityFloats: 1024)])
+        XCTAssertTrue(track.isMuted)
+        XCTAssertEqual(track.framesMuted, 0, "counters reset for the new recording")
+    }
+
+    /// A muted span longer than the internal silence chunk must still be
+    /// written in full.
+    func testLongMutedSpanIsWrittenInFull() {
+        let frames = 10_000
+        let track = CaptureTrack(label: "test", sampleRate: rate)
+        let ring = RingBuffer(capacityFloats: frames * 2 * 2)
+        track.setSinks([ring])
+        track.setMuted(true)
+
+        let tone = [Float](repeating: 0.9, count: frames * 2)
+        tone.withUnsafeBufferPointer {
+            track.append($0.baseAddress!, frameCount: frames, hostTime: ticks(1))
+        }
+
+        XCTAssertEqual(track.framesMuted, frames)
+        var output = [Float](repeating: -1, count: frames * 2)
+        let read = output.withUnsafeMutableBufferPointer {
+            ring.read(into: $0.baseAddress!, maxCount: $0.count)
+        }
+        XCTAssertEqual(read, frames * 2)
+        XCTAssertTrue(output.allSatisfy { $0 == 0 })
+    }
 }
