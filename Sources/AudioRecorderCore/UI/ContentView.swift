@@ -4,6 +4,7 @@ public struct ContentView: View {
     @EnvironmentObject private var state: AppState
     @Environment(\.openWindow) private var openWindow
     @State private var showRecoveryAlert = false
+    @State private var showContinuePrompt = false
     @State private var tab: Tab = .record
     @State private var isEditingName = false
     @State private var draftName = ""
@@ -48,6 +49,18 @@ public struct ContentView: View {
             if active {
                 openWindow(id: "insights")
             }
+        }
+        .onChange(of: state.showContinueRecording) { _, isAsking in
+            // Mirrored into local state so the alert's binding cannot write back
+            // into the prompt: "Yes" and "No" must be the only answers, and a
+            // binding that treated dismissal as an answer would fire twice.
+            showContinuePrompt = isAsking
+        }
+        .alert("Do you want to continue", isPresented: $showContinuePrompt) {
+            Button("Yes") { state.continueRecording() }
+            Button("No", role: .cancel) { state.declineContinueRecording() }
+        } message: {
+            Text(continueRecordingMessage)
         }
         .alert("Interrupted recording found", isPresented: $showRecoveryAlert) {
             Button("Recover") { state.recoverAll() }
@@ -403,6 +416,23 @@ public struct ContentView: View {
         case .keychain:
             return "On · access keys (Keychain) · \(config.region)"
         }
+    }
+
+    // MARK: - Long recording check-in
+
+    /// The body text under the question. The question itself is exactly "Do you
+    /// want to continue"; this says what silence means, because silence stops
+    /// the recording.
+    private var continueRecordingMessage: String {
+        let elapsed = state.recordingStart.map { start -> String in
+            let hours = Int(Date().timeIntervalSince(start) / 3600)
+            return hours == 1 ? "1 hour" : "\(hours) hours"
+        } ?? "\(state.longRecordingCheckInHours) hours"
+        return """
+            This recording has been running for \(elapsed). It will stop and save \
+            automatically in \(state.longRecordingResponseSeconds) seconds unless \
+            you choose Yes.
+            """
     }
 
     // MARK: - Naming row
