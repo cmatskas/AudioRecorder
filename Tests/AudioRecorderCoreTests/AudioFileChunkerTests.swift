@@ -103,8 +103,14 @@ final class AudioFileChunkerTests: XCTestCase {
 
     // MARK: - Pacing
 
-    /// Pacing exists so a replay does not fire-hose the service. Asserting only
-    /// a lower bound keeps this robust on a loaded CI runner.
+    /// Pacing exists so a replay does not fire-hose the service.
+    ///
+    /// Assertions here only depend on sleeps lasting *at least* as long as
+    /// requested, which the platform guarantees. An earlier version asserted an
+    /// upper bound — 1 s of audio at 4x finishing within 900 ms — and failed on a
+    /// loaded CI runner that took 1.04 s, the same trap the debouncer test fell
+    /// into. The delay arithmetic itself is asserted exactly, below, where no
+    /// clock is involved.
     func testRealTimePacingSlowsDeliveryDown() async throws {
         let url = try makeToneFile(seconds: 1)
         let start = ContinuousClock.now
@@ -113,12 +119,34 @@ final class AudioFileChunkerTests: XCTestCase {
         XCTAssertGreaterThan(elapsed, .milliseconds(300))
     }
 
-    func testMultiplePacingIsFasterThanRealTime() async throws {
+    /// Faster than real time is still paced: 1 s of audio at 4x must spend at
+    /// least a quarter of a second sleeping.
+    func testMultiplePacingStillPaces() async throws {
         let url = try makeToneFile(seconds: 1)
         let start = ContinuousClock.now
         _ = try await collect(url, maxDuration: 1, pacing: .multiple(4))
         let elapsed = ContinuousClock.now - start
-        XCTAssertLessThan(elapsed, .milliseconds(900))
+        XCTAssertGreaterThan(elapsed, .milliseconds(150))
+    }
+
+    /// The pacing arithmetic, with no clock in the way: 100 ms of audio per
+    /// chunk, divided by the speed-up.
+    func testPacingDelayArithmetic() {
+        let frames = AudioFileChunker.chunkFrames
+        XCTAssertNil(AudioFileChunker.Pacing.unpaced.delay(forChunkFrames: frames))
+        XCTAssertEqual(
+            AudioFileChunker.Pacing.realTime.delay(forChunkFrames: frames), .milliseconds(100)
+        )
+        XCTAssertEqual(
+            AudioFileChunker.Pacing.multiple(4).delay(forChunkFrames: frames), .milliseconds(25)
+        )
+        XCTAssertEqual(
+            AudioFileChunker.Pacing.multiple(0.5).delay(forChunkFrames: frames), .milliseconds(200)
+        )
+        // Nonsense speed-ups fall back to no delay rather than trapping.
+        XCTAssertNil(AudioFileChunker.Pacing.multiple(0).delay(forChunkFrames: frames))
+        XCTAssertNil(AudioFileChunker.Pacing.multiple(-2).delay(forChunkFrames: frames))
+        XCTAssertNil(AudioFileChunker.Pacing.multiple(.infinity).delay(forChunkFrames: frames))
     }
 
     // MARK: - Head file
