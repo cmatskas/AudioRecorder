@@ -25,6 +25,9 @@ prompt instead of a driver install and an audio-routing detour.
   written independently so a failing disk cannot take both down
 - **Automatic crash recovery** — interrupted recordings are detected on launch
   and can be finished with one click
+- **Long-recording check-in** — after two hours you are asked "Do you want to
+  continue", and hourly after that; no answer within 30 seconds stops and saves
+  the recording rather than filling the disk with an empty room
 - **Named by what they are about** — a finished recording is called
   `Pricing Call`, not `recording_2026-09-03_19-45-58`
 - **Renamable in the app** — click the name, type a new one, press Save
@@ -55,6 +58,30 @@ Settings → Privacy & Security.
 
 **Speech Recognition** is requested separately, the first time a finished
 recording is named on-device. Denying it only costs you automatic names.
+
+## Long recordings
+
+A recording left running by accident — a meeting that ended, a Mac walked away
+from — turns a useful file into hours of an empty room. After two hours the app
+asks **Do you want to continue**, and asks again every hour after that.
+
+The check-in fails closed. **Yes** keeps recording; **No**, or no answer within
+30 seconds, stops the recording and saves it normally — nothing is discarded, and
+the file is named and finalized exactly as if you had pressed stop. The app brings
+itself to the front and bounces in the Dock when it asks, because a question
+nobody sees ends the recording.
+
+To try it without waiting two hours:
+
+```bash
+defaults write dev.cmatskas.AudioRecorder longRecordingCheckInMinutes 2
+defaults write dev.cmatskas.AudioRecorder longRecordingRepeatMinutes 1
+defaults write dev.cmatskas.AudioRecorder longRecordingResponseSeconds 15
+# then, to restore the shipping behaviour:
+defaults delete dev.cmatskas.AudioRecorder longRecordingCheckInMinutes
+defaults delete dev.cmatskas.AudioRecorder longRecordingRepeatMinutes
+defaults delete dev.cmatskas.AudioRecorder longRecordingResponseSeconds
+```
 
 ## Recording names
 
@@ -161,9 +188,11 @@ swift test
 The suite covers the ring buffer, CAF crash-safety (a file abandoned without
 finalizing must still be fully readable), rate-mismatched merging, timeline
 alignment from anchors, dropout gap filling, uneven track lengths, manifest
-migration, crash recovery from unfinalized streams, name sanitizing and the
-offline title heuristic, the rename operation (including collisions, rejected
-names, and an unwritable destination), and audio chunking for naming.
+migration, crash recovery from unfinalized streams, the long-recording check-in
+(asking on time, stopping on silence or "No", continuing and re-asking on "Yes"),
+name sanitizing and the offline title heuristic, the rename operation (including
+collisions, rejected names, and an unwritable destination), and audio chunking for
+naming.
 
 ## License
 

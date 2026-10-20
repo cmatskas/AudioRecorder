@@ -24,6 +24,10 @@ public final class AppState: ObservableObject {
     @Published public private(set) var systemMuted = false
     @Published public private(set) var isSaving = false
     @Published public private(set) var recordingStart: Date?
+    /// Presents the two-hour (then hourly) "Do you want to continue" check-in.
+    @Published public private(set) var showContinueRecording = false
+    /// When an unanswered check-in will stop the recording, for the countdown.
+    @Published public private(set) var continueRecordingDeadline: Date?
     @Published public var statusMessage: String?
     @Published public var errorMessage: String?
     @Published public private(set) var lastSavedURL: URL?
@@ -133,6 +137,9 @@ public final class AppState: ObservableObject {
     public var cloudNamingTranscriberFactory: ((InsightsConfiguration) -> any NamingTranscriber)?
 
     private var namingTask: Task<Void, Never>?
+    /// Why the current recording is ending, when it was not the user pressing
+    /// stop. Shown once saving finishes, which is when the banner is written.
+    private var stopReason: String?
     private var cloudNamingConsentGranted: Bool
     private static let autoNameKey = "autoNameRecordings"
     private static let namingBackendKey = "namingBackend"
@@ -169,6 +176,9 @@ public final class AppState: ObservableObject {
     public let backupRoot: URL
     private var engine: CaptureEngine?
     private var session: RecordingSession?
+    /// Watches how long the current recording has run and asks whether to keep
+    /// going. Owned here so it dies with the recording.
+    private let longRecordingPrompt: LongRecordingPrompt
     private var stopObservingDevices: (() -> Void)?
     private static let destinationDefaultsKey = "userDestinationPath"
     /// Serial queue for all engine construction/teardown: tap and aggregate
@@ -183,7 +193,13 @@ public final class AppState: ObservableObject {
     /// so startup builds the capture engine exactly once.
     private var isInitializing = true
 
-    public init() {
+    /// - Parameter longRecordingTuning: check-in timing. Defaults to the
+    ///   shipping behaviour (two hours, then hourly, 30 seconds to answer),
+    ///   with UserDefaults overrides for testing it in minutes.
+    public init(longRecordingTuning: LongRecordingPrompt.Tuning? = nil) {
+        longRecordingPrompt = LongRecordingPrompt(
+            tuning: longRecordingTuning ?? .resolved()
+        )
         insightsConfiguration = InsightsConfiguration.load()
         insightsEnabled = UserDefaults.standard.bool(forKey: Self.insightsEnabledKey)
         let defaults = UserDefaults.standard
@@ -398,11 +414,13 @@ public final class AppState: ObservableObject {
                 newSession.start()
                 session = newSession
                 isRecording = true
-                recordingStart = Date()
+                let startedAt = Date()
+                recordingStart = startedAt
                 // Always start unmuted: a mute left on from a previous
                 // recording would silently produce a silent one.
                 setMuted(false, forSource: "mic")
                 setMuted(false, forSource: "system")
+                startLongRecordingWatch(startedAt: startedAt)
 
                 if let pipeline {
                     pipeline.start(
@@ -428,6 +446,10 @@ public final class AppState: ObservableObject {
         isRecording = false
         recordingStart = nil
         isSaving = true
+        // The check-in belongs to this recording only.
+        longRecordingPrompt.cancel()
+        showContinueRecording = false
+        continueRecordingDeadline = nil
         let pipeline = insightsPipeline
         insightsPipeline = nil
         Task.detached(priority: .userInitiated) {
@@ -446,12 +468,15 @@ public final class AppState: ObservableObject {
                     self.lastSavedName = saved?.deletingPathExtension().lastPathComponent
                         ?? result.sessionDirectory.lastPathComponent
                     // The file name is its own control now, so the banner is
-                    // left for what actually needs saying.
-                    if !result.warnings.isEmpty {
-                        self.statusMessage = "⚠ " + result.warnings.joined(separator: "\n⚠ ")
-                    } else {
-                        self.statusMessage = nil
+                    // left for what actually needs saying: why the recording
+                    // stopped, if it was not the user's doing, and any warnings.
+                    var lines: [String] = []
+                    if let reason = self.stopReason {
+                        lines.append(reason)
+                        self.stopReason = nil
                     }
+                    lines.append(contentsOf: result.warnings.map { "⚠ \($0)" })
+                    self.statusMessage = lines.isEmpty ? nil : lines.joined(separator: "\n")
                 }
             } catch {
                 await MainActor.run { [weak self] in
@@ -471,13 +496,79 @@ public final class AppState: ObservableObject {
             // Naming comes last: it needs the finished file and, when there was
             // one, the complete transcript.
             if let sessionDirectory {
+                let audioURL = audioForNaming
                 await MainActor.run { [weak self] in
-                    self?.startNaming(
-                        sessionDirectory: sessionDirectory, audioURL: audioForNaming
-                    )
+                    self?.startNaming(sessionDirectory: sessionDirectory, audioURL: audioURL)
                 }
             }
         }
+    }
+
+    // MARK: - Long recording check-in
+
+    /// How long a recording runs before the first "Do you want to continue",
+    /// for the UI to explain itself with.
+    public var longRecordingCheckInHours: Int {
+        max(1, Int((longRecordingPrompt.tuning.firstCheckIn / 3600).rounded()))
+    }
+
+    /// Seconds the user has to answer a check-in.
+    public var longRecordingResponseSeconds: Int {
+        max(1, Int(longRecordingPrompt.tuning.responseWindow.rounded()))
+    }
+
+    private func startLongRecordingWatch(startedAt: Date) {
+        longRecordingPrompt.start(
+            startedAt: startedAt,
+            ask: { [weak self] in
+                guard let self else { return }
+                self.continueRecordingDeadline = self.longRecordingPrompt.responseDeadline
+                self.showContinueRecording = true
+                // A question nobody sees stops the recording, so it has to be
+                // put in front of the user even if they are in another app.
+                NSApp.activate(ignoringOtherApps: true)
+                NSApp.requestUserAttention(.criticalRequest)
+            },
+            stop: { [weak self] reason in
+                guard let self else { return }
+                self.showContinueRecording = false
+                self.continueRecordingDeadline = nil
+                guard self.isRecording else { return }
+                // An unanswered check-in needs explaining; answering "No" does
+                // not, because the user just did it. The reason is stored rather
+                // than shown now: the banner is rewritten when saving finishes,
+                // which would otherwise erase it.
+                switch reason {
+                case .unanswered:
+                    // Read the elapsed time before stopping clears it, so a
+                    // recording that ran four hours does not report two.
+                    if let start = self.recordingStart {
+                        let hours = max(1, Int(Date().timeIntervalSince(start) / 3600))
+                        self.stopReason =
+                            "Recording stopped after \(hours) \(hours == 1 ? "hour" : "hours") — the check-in went unanswered"
+                    } else {
+                        self.stopReason = "Recording stopped — the check-in went unanswered"
+                    }
+                case .declined:
+                    self.stopReason = nil
+                }
+                self.stopRecording()
+            }
+        )
+    }
+
+    /// "Yes" — keep recording, and ask again after the interval.
+    public func continueRecording() {
+        showContinueRecording = false
+        continueRecordingDeadline = nil
+        longRecordingPrompt.confirmContinue()
+    }
+
+    /// "No" — stop and save now.
+    public func declineContinueRecording() {
+        showContinueRecording = false
+        continueRecordingDeadline = nil
+        longRecordingPrompt.decline()
     }
 
     // MARK: - Naming
